@@ -10,10 +10,21 @@ interface Message {
     timestamp: Date;
 }
 
+const USER_KEY = 'dt_user_id';
+
+function getOrCreateUserId() {
+    const existing = localStorage.getItem(USER_KEY);
+    if (existing) return existing;
+    const id = crypto.randomUUID();
+    localStorage.setItem(USER_KEY, id);
+    return id;
+}
+
 export default function Twin() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
+    const [userId, setUserId] = useState('');
     const [sessionId, setSessionId] = useState<string>('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -25,8 +36,12 @@ export default function Twin() {
         scrollToBottom();
     }, [messages]);
 
+    useEffect(() => {
+        setUserId(getOrCreateUserId());
+    }, []);
+
     const sendMessage = async () => {
-        if (!input.trim() || isLoading) return;
+        if (!input.trim() || isLoading || !userId) return;
 
         const userMessage: Message = {
             id: Date.now().toString(),
@@ -46,6 +61,7 @@ export default function Twin() {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
+                    user_id: userId,
                     message: input,
                     session_id: sessionId || undefined,
                 }),

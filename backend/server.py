@@ -1,13 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 import json
 import uuid
-from datetime import datetime
 from pathlib import Path
 
 # Load environment variables
@@ -42,32 +41,40 @@ def load_personality():
 PERSONALITY = load_personality()
 
 
-# Memory functions
-def load_conversation(session_id: str) -> List[Dict]:
-    """Load conversation history from file"""
-    file_path = MEMORY_DIR / f"{session_id}.json"
+def _user_memory_dir(user_id: str) -> Path:
+    user_dir = MEMORY_DIR / user_id
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return user_dir
+
+
+def load_conversation(user_id: str, session_id: str) -> List[Dict]:
+    file_path = _user_memory_dir(user_id) / f"{session_id}.json"
     if file_path.exists():
         with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
     return []
 
 
-def save_conversation(session_id: str, messages: List[Dict]):
-    """Save conversation history to file"""
-    file_path = MEMORY_DIR / f"{session_id}.json"
+def save_conversation(user_id: str, session_id: str, messages: List[Dict]):
+    file_path = _user_memory_dir(user_id) / f"{session_id}.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(messages, f, indent=2, ensure_ascii=False)
+
+USER_ID_PATTERN = r"^[a-zA-Z0-9_-]{3,64}$"
 
 
 # Request/Response models
 class ChatRequest(BaseModel):
-    message: str
+    user_id: str = Field(..., pattern=USER_ID_PATTERN)
+    message: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
+    user_id: str
     response: str
     session_id: str
+
 
 
 @app.get("/")
@@ -83,59 +90,52 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
-        
-        # Load conversation history
-        conversation = load_conversation(session_id)
-        
-        # Build messages with history
+
+        conversation = load_conversation(request.user_id, session_id)
+
         messages = [{"role": "system", "content": PERSONALITY}]
-        
-        # Add conversation history
-        for msg in conversation:
-            messages.append(msg)
-        
-        # Add current message
+        messages.extend(conversation)
         messages.append({"role": "user", "content": request.message})
-        
-        # Call OpenAI API
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
         )
-        
+
         assistant_response = response.choices[0].message.content
-        
-        # Update conversation history
+
         conversation.append({"role": "user", "content": request.message})
         conversation.append({"role": "assistant", "content": assistant_response})
-        
-        # Save updated conversation
-        save_conversation(session_id, conversation)
-        
+
+        save_conversation(request.user_id, session_id, conversation)
+
         return ChatResponse(
+            user_id=request.user_id,
             response=assistant_response,
             session_id=session_id
         )
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/sessions")
 async def list_sessions():
-    """List all conversation sessions"""
+    """List all conversation sessions grouped by user"""
     sessions = []
-    for file_path in MEMORY_DIR.glob("*.json"):
-        session_id = file_path.stem
-        with open(file_path, "r", encoding="utf-8") as f:
-            conversation = json.load(f)
-            sessions.append({
-                "session_id": session_id,
-                "message_count": len(conversation),
-                "last_message": conversation[-1]["content"] if conversation else None
-            })
+    for user_dir in MEMORY_DIR.iterdir():
+        if not user_dir.is_dir():
+            continue
+        for file_path in user_dir.glob("*.json"):
+            session_id = file_path.stem
+            with open(file_path, "r", encoding="utf-8") as f:
+                conversation = json.load(f)
+                sessions.append({
+                    "user_id": user_dir.name,
+                    "session_id": session_id,
+                    "message_count": len(conversation),
+                    "last_message": conversation[-1]["content"] if conversation else None
+                })
     return {"sessions": sessions}
 
 
