@@ -15,7 +15,7 @@ load_dotenv(override=True)
 app = FastAPI()
 
 # Configure CORS
-origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -120,23 +120,25 @@ async def chat(request: ChatRequest):
 
 
 @app.get("/sessions")
-async def list_sessions():
-    """List all conversation sessions grouped by user"""
+async def list_sessions(user_id: str):
+    """List only one user's sessions"""
+    user_dir = MEMORY_DIR / user_id
+    if not user_dir.exists() or not user_dir.is_dir():
+        return {"user_id": user_id, "sessions": []}
+
     sessions = []
-    for user_dir in MEMORY_DIR.iterdir():
-        if not user_dir.is_dir():
-            continue
-        for file_path in user_dir.glob("*.json"):
-            session_id = file_path.stem
-            with open(file_path, "r", encoding="utf-8") as f:
-                conversation = json.load(f)
-                sessions.append({
-                    "user_id": user_dir.name,
-                    "session_id": session_id,
-                    "message_count": len(conversation),
-                    "last_message": conversation[-1]["content"] if conversation else None
-                })
-    return {"sessions": sessions}
+    for file_path in user_dir.glob("*.json"):
+        session_id = file_path.stem
+        with open(file_path, "r", encoding="utf-8") as f:
+            conversation = json.load(f)
+            sessions.append({
+                "user_id": user_id,
+                "session_id": session_id,
+                "message_count": len(conversation),
+                "last_message": conversation[-1]["content"] if conversation else None
+            })
+
+    return {"user_id": user_id, "sessions": sessions}
 
 
 if __name__ == "__main__":
