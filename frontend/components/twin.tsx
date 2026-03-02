@@ -11,11 +11,14 @@ interface Message {
 }
 
 const USER_KEY = 'dt_user_id';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
 function getOrCreateUserId() {
     const existing = localStorage.getItem(USER_KEY);
     if (existing) return existing;
-    const id = crypto.randomUUID();
+    const id = globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    
     localStorage.setItem(USER_KEY, id);
     return id;
 }
@@ -55,7 +58,7 @@ export default function Twin() {
         setIsLoading(true);
 
         try {
-            const response = await fetch('http://localhost:8000/chat', {
+            const response = await fetch(`${API_BASE_URL}/chat`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
