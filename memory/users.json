@@ -1,0 +1,33 @@
+[
+  {
+    "user_id": "77d2415a-8875-4286-9f05-362c69a8ba1d",
+    "first_name": "Omkar",
+    "last_name": "Thakur",
+    "email": "omkar.1772447397@example.com",
+    "phone": null,
+    "password_hash": "$pbkdf2-sha256$29000$55yzVqpVCiGEEAKAMIaQEg$iFaoyTlnbtkQ4zMiZP3fM8Y7sB2OiMErbJ1LU1Q/WQ4",
+    "is_email_verified": false,
+    "created_at": "2026-03-02T10:29:57.483760+00:00"
+  },
+  {
+    "user_id": "ff7ef799-7817-4d45-950f-4504791a63fa",
+    "first_name": "Omkarnath",
+    "last_name": "Thakur",
+    "email": "live.onkar@gmail.com",
+    "phone": "6026680832",
+    "password_hash": "$pbkdf2-sha256$29000$IOS8d07Jubf2vvcewxhDKA$SsA6Jejffai1rYOFghyEjORk3wAhd625g.iHwzOk/Rw",
+    "is_email_verified": false,
+    "created_at": "2026-03-02T10:34:06.471417+00:00"
+  },
+  {
+    "user_id": "ad315c9b-eb31-45df-a3ea-ee3974ee04db",
+    "first_name": "Omkarnath",
+    "last_name": "Thakur",
+    "email": "othakur@umd.edu",
+    "phone": null,
+    "password_hash": "$pbkdf2-sha256$29000$BuC8t9b6X.t97x2j1DqndA$Ez6wrPTlMf9hOF0caD/xhweo.ahE4xvhQzMEIuZvgvA",
+    "is_email_verified": true,
+    "created_at": "2026-03-02T10:35:28.637549+00:00",
+    "email_verified_at": "2026-03-02T10:36:57.033499+00:00"
+  }
+]

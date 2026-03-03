@@ -1,0 +1,44 @@
+{
+  "user_id": "ad315c9b-eb31-45df-a3ea-ee3974ee04db",
+  "session_id": "891392fb-30fd-4562-be2f-9a150b7a1fe8",
+  "created_at": "2026-03-02T11:57:52.068681+00:00",
+  "updated_at": "2026-03-02T11:57:53.800963+00:00",
+  "is_deleted": false,
+  "deleted_at": null,
+  "deleted_by": null,
+  "delete_reason": null,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hey how you doing"
+    },
+    {
+      "role": "assistant",
+      "content": "Hello! I'm doing well, thank you for asking. How can I assist you today?"
+    },
+    {
+      "role": "user",
+      "content": "what is my name"
+    },
+    {
+      "role": "assistant",
+      "content": "I'm not able to know your name unless you tell me. How would you like me to address you?"
+    },
+    {
+      "role": "user",
+      "content": "I am om Thakur"
+    },
+    {
+      "role": "assistant",
+      "content": "Nice to meet you, Om! How can I assist you today?"
+    },
+    {
+      "role": "user",
+      "content": "whats my name"
+    },
+    {
+      "role": "assistant",
+      "content": "Your name is Om Thakur. How can I help you today, Om?"
+    }
+  ]
+}
