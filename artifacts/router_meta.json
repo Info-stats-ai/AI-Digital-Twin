@@ -1,0 +1,20 @@
+{
+  "target": "best_expert_label",
+  "feature_columns": [
+    "query",
+    "contains_code",
+    "error_log_present",
+    "memory_needed",
+    "multi_hop",
+    "estimated_input_tokens",
+    "latency_budget_ms",
+    "difficulty",
+    "retrieval_quality_label"
+  ],
+  "classes": [
+    "gpt_fallback",
+    "memory_factual_expert",
+    "technical_expert"
+  ],
+  "default_threshold": 0.62
+}

@@ -15,6 +15,10 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 import smtplib
 from email.message import EmailMessage
+import joblib
+import pandas as pd
+import numpy as np
+
 
 # Load environment variables
 load_dotenv(override=True)
@@ -47,6 +51,10 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "no-reply@digitaltwin.local")
+ROUTER_MODEL_PATH = os.getenv("ROUTER_MODEL_PATH", "../artifacts/router_tfidf_lr.pkl")
+ROUTER_META_PATH = os.getenv("ROUTER_META_PATH", "../artifacts/router_meta.json")
+ROUTER_CONF_THRESHOLD = float(os.getenv("ROUTER_CONF_THRESHOLD", "0.62"))
+DEFAULT_OPENAI_MODEL = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4o-mini")
 
 # Memory directory
 MEMORY_DIR = Path("../memory")
@@ -62,6 +70,31 @@ def load_personality():
 
 
 PERSONALITY = load_personality()
+
+EXPERT_TO_MODEL_ROUTE = {
+    "memory_factual_expert": "phi-3-mini-4k-instruct",
+    "technical_expert": "qwen2.5-coder-7b-instruct",
+    "gpt_fallback": "gpt-4o-mini",
+}
+
+# We currently call OpenAI from this backend. For now, map non-OpenAI expert routes
+# to the default OpenAI model until OSS expert serving is wired in.
+MODEL_ALIAS_TO_RUNTIME_MODEL = {
+    "phi-3-mini-4k-instruct": DEFAULT_OPENAI_MODEL,
+    "qwen2.5-coder-7b-instruct": DEFAULT_OPENAI_MODEL,
+    "gpt-4o-mini": "gpt-4o-mini",
+    "gpt-4.1": "gpt-4.1",
+}
+
+router_model = None
+router_meta: Optional[Dict[str, Any]] = None
+try:
+    router_model = joblib.load(ROUTER_MODEL_PATH)
+    with open(ROUTER_META_PATH, "r", encoding="utf-8") as f:
+        router_meta = json.load(f)
+    print(f"[router] loaded model from {ROUTER_MODEL_PATH}")
+except Exception as e:
+    print(f"[router] not loaded, fallback mode active: {e}")
 
 
 def now_iso() -> str:
@@ -174,6 +207,80 @@ def append_audit_log(action: str, user_id: str, session_id: Optional[str] = None
     with open(AUDIT_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+
+def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[str, Any]:
+    """Predict route using trained LR router; fallback to GPT route if unavailable/low confidence."""
+    if router_model is None:
+        alias = EXPERT_TO_MODEL_ROUTE["gpt_fallback"]
+        return {
+            "expert_label": "gpt_fallback",
+            "raw_expert_label": "gpt_fallback",
+            "confidence": 0.0,
+            "fallback_triggered": True,
+            "reason": "router_not_loaded",
+            "model_route_alias": alias,
+            "runtime_model": MODEL_ALIAS_TO_RUNTIME_MODEL.get(alias, DEFAULT_OPENAI_MODEL),
+        }
+
+    q_lower = query.lower()
+    contains_code = int(any(tok in q_lower for tok in ["traceback", "exception", "error", "code", "python", "npm", "fastapi", "tsx", "{", "}"]))
+    error_log_present = int(any(tok in q_lower for tok in ["traceback", "exception", "error:", "failed", "module not found"]))
+    memory_needed = int(any(tok in q_lower for tok in ["remember", "earlier", "previous", "my role", "my goals", "what did i say"]))
+    multi_hop = int(any(tok in q_lower for tok in ["compare", "tradeoff", "strategy", "roadmap", "analyze", "design"]))
+
+    estimated_tokens = max(20, min(500, int(len(query.split()) * 1.5)))
+    if estimated_tokens < 80:
+        difficulty = "easy"
+        latency_budget_ms = 900
+    elif estimated_tokens < 180:
+        difficulty = "med"
+        latency_budget_ms = 1800
+    else:
+        difficulty = "hard"
+        latency_budget_ms = 3000
+
+    row = pd.DataFrame([{
+        "query": query,
+        "contains_code": contains_code,
+        "error_log_present": error_log_present,
+        "memory_needed": memory_needed,
+        "multi_hop": multi_hop,
+        "estimated_input_tokens": estimated_tokens,
+        "latency_budget_ms": latency_budget_ms,
+        "difficulty": difficulty,
+        "retrieval_quality_label": retrieval_quality_label,
+    }])
+
+    probs = router_model.predict_proba(row)[0]
+    classes = router_model.named_steps["clf"].classes_
+    idx = int(np.argmax(probs))
+    raw_expert = str(classes[idx])
+    confidence = float(probs[idx])
+
+    fallback_triggered = confidence < ROUTER_CONF_THRESHOLD
+    final_expert = "gpt_fallback" if fallback_triggered else raw_expert
+
+    alias = EXPERT_TO_MODEL_ROUTE.get(final_expert, EXPERT_TO_MODEL_ROUTE["gpt_fallback"])
+    runtime_model = MODEL_ALIAS_TO_RUNTIME_MODEL.get(alias, DEFAULT_OPENAI_MODEL)
+    return {
+        "expert_label": final_expert,
+        "raw_expert_label": raw_expert,
+        "confidence": confidence,
+        "fallback_triggered": fallback_triggered,
+        "model_route_alias": alias,
+        "runtime_model": runtime_model,
+        "features": {
+            "contains_code": contains_code,
+            "error_log_present": error_log_present,
+            "memory_needed": memory_needed,
+            "multi_hop": multi_hop,
+            "estimated_input_tokens": estimated_tokens,
+            "difficulty": difficulty,
+            "retrieval_quality_label": retrieval_quality_label,
+            "latency_budget_ms": latency_budget_ms,
+        },
+    }
+
 USER_ID_PATTERN = r"^[a-zA-Z0-9_-]{3,64}$"
 PHONE_PATTERN = r"^\+?[1-9]\d{7,14}$"
 
@@ -188,6 +295,11 @@ class ChatResponse(BaseModel):
     user_id: str
     response: str
     session_id: str
+    router_label: Optional[str] = None
+    router_confidence: Optional[float] = None
+    model_route_alias: Optional[str] = None
+    runtime_model: Optional[str] = None
+    fallback_triggered: Optional[bool] = None
 
 
 class SessionEnvelope(BaseModel):
@@ -436,8 +548,11 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         messages.extend(session_env.messages)
         messages.append({"role": "user", "content": request.message})
 
+        router_decision = infer_router(request.message, retrieval_quality_label="medium")
+        selected_runtime_model = router_decision["runtime_model"]
+
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=selected_runtime_model,
             messages=messages
         )
 
@@ -450,7 +565,12 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         return ChatResponse(
             user_id=user_id,
             response=assistant_response,
-            session_id=session_id
+            session_id=session_id,
+            router_label=router_decision["expert_label"],
+            router_confidence=router_decision["confidence"],
+            model_route_alias=router_decision["model_route_alias"],
+            runtime_model=selected_runtime_model,
+            fallback_triggered=router_decision["fallback_triggered"],
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

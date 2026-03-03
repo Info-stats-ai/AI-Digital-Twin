@@ -6,3 +6,7 @@ python-multipart
 python-jose[cryptography]
 passlib[bcrypt]
 email-validator
+numpy
+pandas
+scikit-learn==1.6.1
+joblib
