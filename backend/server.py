@@ -18,6 +18,8 @@ from email.message import EmailMessage
 import joblib
 import pandas as pd
 import numpy as np
+import requests
+import time
 
 
 # Load environment variables
@@ -55,6 +57,9 @@ ROUTER_MODEL_PATH = os.getenv("ROUTER_MODEL_PATH", "../artifacts/router_tfidf_lr
 ROUTER_META_PATH = os.getenv("ROUTER_META_PATH", "../artifacts/router_meta.json")
 ROUTER_CONF_THRESHOLD = float(os.getenv("ROUTER_CONF_THRESHOLD", "0.62"))
 DEFAULT_OPENAI_MODEL = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", DEFAULT_OPENAI_MODEL)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "30"))
 
 # Memory directory
 MEMORY_DIR = Path("../memory")
@@ -71,19 +76,10 @@ def load_personality():
 
 PERSONALITY = load_personality()
 
-EXPERT_TO_MODEL_ROUTE = {
-    "memory_factual_expert": "phi-3-mini-4k-instruct",
-    "technical_expert": "qwen2.5-coder-7b-instruct",
-    "gpt_fallback": "gpt-4o-mini",
-}
-
-# We currently call OpenAI from this backend. For now, map non-OpenAI expert routes
-# to the default OpenAI model until OSS expert serving is wired in.
-MODEL_ALIAS_TO_RUNTIME_MODEL = {
-    "phi-3-mini-4k-instruct": DEFAULT_OPENAI_MODEL,
-    "qwen2.5-coder-7b-instruct": DEFAULT_OPENAI_MODEL,
-    "gpt-4o-mini": "gpt-4o-mini",
-    "gpt-4.1": "gpt-4.1",
+EXPERT_TO_PROVIDER_ROUTE = {
+    "memory_factual_expert": {"provider": "ollama", "model": "phi3:mini"},
+    "technical_expert": {"provider": "ollama", "model": "qwen2.5-coder:7b-instruct"},
+    "gpt_fallback": {"provider": "openai", "model": OPENAI_FALLBACK_MODEL},
 }
 
 router_model = None
@@ -211,15 +207,15 @@ def append_audit_log(action: str, user_id: str, session_id: Optional[str] = None
 def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[str, Any]:
     """Predict route using trained LR router; fallback to GPT route if unavailable/low confidence."""
     if router_model is None:
-        alias = EXPERT_TO_MODEL_ROUTE["gpt_fallback"]
+        route = EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"]
         return {
             "expert_label": "gpt_fallback",
             "raw_expert_label": "gpt_fallback",
             "confidence": 0.0,
             "fallback_triggered": True,
             "reason": "router_not_loaded",
-            "model_route_alias": alias,
-            "runtime_model": MODEL_ALIAS_TO_RUNTIME_MODEL.get(alias, DEFAULT_OPENAI_MODEL),
+            "provider": route["provider"],
+            "model_route_alias": route["model"],
         }
 
     q_lower = query.lower()
@@ -260,15 +256,14 @@ def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[st
     fallback_triggered = confidence < ROUTER_CONF_THRESHOLD
     final_expert = "gpt_fallback" if fallback_triggered else raw_expert
 
-    alias = EXPERT_TO_MODEL_ROUTE.get(final_expert, EXPERT_TO_MODEL_ROUTE["gpt_fallback"])
-    runtime_model = MODEL_ALIAS_TO_RUNTIME_MODEL.get(alias, DEFAULT_OPENAI_MODEL)
+    route = EXPERT_TO_PROVIDER_ROUTE.get(final_expert, EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"])
     return {
         "expert_label": final_expert,
         "raw_expert_label": raw_expert,
         "confidence": confidence,
         "fallback_triggered": fallback_triggered,
-        "model_route_alias": alias,
-        "runtime_model": runtime_model,
+        "provider": route["provider"],
+        "model_route_alias": route["model"],
         "features": {
             "contains_code": contains_code,
             "error_log_present": error_log_present,
@@ -280,6 +275,51 @@ def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[st
             "latency_budget_ms": latency_budget_ms,
         },
     }
+
+
+def ollama_chat(model: str, messages: List[Dict[str, str]]) -> str:
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {"model": model, "messages": messages, "stream": False}
+    resp = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT_SEC)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["message"]["content"]
+
+
+def generate_with_route(messages: List[Dict[str, str]], router_decision: Dict[str, Any]) -> Dict[str, Any]:
+    provider = router_decision["provider"]
+    model = router_decision["model_route_alias"]
+    start = time.time()
+    fallback_triggered = False
+    fallback_reason = None
+
+    try:
+        if provider == "ollama":
+            text = ollama_chat(model=model, messages=messages)
+        else:
+            resp = client.chat.completions.create(model=model, messages=messages)
+            text = resp.choices[0].message.content
+        return {
+            "text": text,
+            "provider_used": provider,
+            "model_used": model,
+            "latency_ms": int((time.time() - start) * 1000),
+            "fallback_triggered": fallback_triggered,
+            "fallback_reason": fallback_reason,
+        }
+    except Exception as exc:
+        fallback_triggered = True
+        fallback_reason = f"{provider}_error: {exc}"
+        resp = client.chat.completions.create(model=OPENAI_FALLBACK_MODEL, messages=messages)
+        text = resp.choices[0].message.content
+        return {
+            "text": text,
+            "provider_used": "openai",
+            "model_used": OPENAI_FALLBACK_MODEL,
+            "latency_ms": int((time.time() - start) * 1000),
+            "fallback_triggered": fallback_triggered,
+            "fallback_reason": fallback_reason,
+        }
 
 USER_ID_PATTERN = r"^[a-zA-Z0-9_-]{3,64}$"
 PHONE_PATTERN = r"^\+?[1-9]\d{7,14}$"
@@ -297,9 +337,12 @@ class ChatResponse(BaseModel):
     session_id: str
     router_label: Optional[str] = None
     router_confidence: Optional[float] = None
+    route_provider: Optional[str] = None
     model_route_alias: Optional[str] = None
     runtime_model: Optional[str] = None
     fallback_triggered: Optional[bool] = None
+    fallback_reason: Optional[str] = None
+    latency_ms: Optional[int] = None
 
 
 class SessionEnvelope(BaseModel):
@@ -549,14 +592,8 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         messages.append({"role": "user", "content": request.message})
 
         router_decision = infer_router(request.message, retrieval_quality_label="medium")
-        selected_runtime_model = router_decision["runtime_model"]
-
-        response = client.chat.completions.create(
-            model=selected_runtime_model,
-            messages=messages
-        )
-
-        assistant_response = response.choices[0].message.content
+        gen = generate_with_route(messages=messages, router_decision=router_decision)
+        assistant_response = gen["text"]
 
         session_env.messages.append({"role": "user", "content": request.message})
         session_env.messages.append({"role": "assistant", "content": assistant_response})
@@ -568,9 +605,12 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             session_id=session_id,
             router_label=router_decision["expert_label"],
             router_confidence=router_decision["confidence"],
+            route_provider=gen["provider_used"],
             model_route_alias=router_decision["model_route_alias"],
-            runtime_model=selected_runtime_model,
-            fallback_triggered=router_decision["fallback_triggered"],
+            runtime_model=gen["model_used"],
+            fallback_triggered=gen["fallback_triggered"] or router_decision["fallback_triggered"],
+            fallback_reason=gen["fallback_reason"],
+            latency_ms=gen["latency_ms"],
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
