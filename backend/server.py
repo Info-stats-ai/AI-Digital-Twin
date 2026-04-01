@@ -66,6 +66,7 @@ MEMORY_DIR = Path("../memory")
 MEMORY_DIR.mkdir(exist_ok=True)
 USERS_FILE = MEMORY_DIR / "users.json"
 AUDIT_FILE = MEMORY_DIR / "audit.log"
+ROUTE_TELEMETRY_FILE = MEMORY_DIR / "route_telemetry.jsonl"
 
 
 # Load personality details
@@ -201,6 +202,12 @@ def append_audit_log(action: str, user_id: str, session_id: Optional[str] = None
         "detail": detail,
     }
     with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_route_telemetry(record: Dict[str, Any]) -> None:
+    """Append one route execution event as JSONL for phase 2.3 analysis."""
+    with open(ROUTE_TELEMETRY_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -580,6 +587,7 @@ async def me(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
+        request_id = str(uuid.uuid4())
         user_id = current_user["user_id"]
         session_id = request.session_id or str(uuid.uuid4())
 
@@ -594,6 +602,24 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         router_decision = infer_router(request.message, retrieval_quality_label="medium")
         gen = generate_with_route(messages=messages, router_decision=router_decision)
         assistant_response = gen["text"]
+
+        append_route_telemetry({
+            "timestamp": now_iso(),
+            "request_id": request_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "query": request.message,
+            "router_label": router_decision["expert_label"],
+            "router_raw_label": router_decision["raw_expert_label"],
+            "router_confidence": router_decision["confidence"],
+            "route_provider": gen["provider_used"],
+            "route_model_alias": router_decision["model_route_alias"],
+            "runtime_model": gen["model_used"],
+            "fallback_triggered": bool(gen["fallback_triggered"] or router_decision["fallback_triggered"]),
+            "fallback_reason": gen["fallback_reason"],
+            "latency_ms": gen["latency_ms"],
+            "success": True,
+        })
 
         session_env.messages.append({"role": "user", "content": request.message})
         session_env.messages.append({"role": "assistant", "content": assistant_response})
@@ -613,6 +639,24 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             latency_ms=gen["latency_ms"],
         )
     except Exception as e:
+        append_route_telemetry({
+            "timestamp": now_iso(),
+            "request_id": str(uuid.uuid4()),
+            "user_id": current_user.get("user_id", "unknown"),
+            "session_id": request.session_id,
+            "query": request.message,
+            "router_label": None,
+            "router_raw_label": None,
+            "router_confidence": None,
+            "route_provider": None,
+            "route_model_alias": None,
+            "runtime_model": None,
+            "fallback_triggered": None,
+            "fallback_reason": None,
+            "latency_ms": None,
+            "success": False,
+            "error": str(e),
+        })
         raise HTTPException(status_code=500, detail=str(e))
 
 
