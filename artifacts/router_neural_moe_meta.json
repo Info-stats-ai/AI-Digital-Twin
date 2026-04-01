@@ -1,0 +1,24 @@
+{
+  "val_accuracy": 0.90997150997151,
+  "val_macro_f1": 0.9065303683762701,
+  "test_accuracy": 0.89002849002849,
+  "test_macro_f1": 0.8840674360073107,
+  "num_rows": 11700,
+  "num_classes": 13,
+  "classes": [
+    "agentic_ai_expert",
+    "dl_expert",
+    "friendly_conversation_expert",
+    "genai_expert",
+    "gpt_fallback",
+    "llm_eval_expert",
+    "math_reasoning_expert",
+    "memory_factual_expert",
+    "ml_expert",
+    "multimodal_expert",
+    "rag_expert",
+    "research_expert",
+    "technical_expert"
+  ],
+  "encoder_model": "sentence-transformers/all-MiniLM-L6-v2"
+}

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field, EmailStr, model_validator
@@ -21,6 +21,14 @@ import numpy as np
 import requests
 import time
 import asyncio
+import base64
+import mimetypes
+import hashlib
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 
 
 # Load environment variables
@@ -63,6 +71,10 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "30"))
 MULTIMODAL_OPENAI_MODEL = os.getenv("MULTIMODAL_OPENAI_MODEL", "gpt-4.1-mini")
 MEMORY_RETRIEVAL_TOP_K = int(os.getenv("MEMORY_RETRIEVAL_TOP_K", "3"))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+RAG_CHUNK_WORDS = int(os.getenv("RAG_CHUNK_WORDS", "180"))
+RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "40"))
 
 # Memory directory
 MEMORY_DIR = Path("../memory")
@@ -83,14 +95,14 @@ PERSONALITY = load_personality()
 EXPERT_TO_PROVIDER_ROUTE = {
     "memory_factual_expert": {"provider": "ollama", "model": "phi3:mini"},
     "technical_expert": {"provider": "ollama", "model": "qwen2.5-coder:7b-instruct"},
-    "ml_expert": {"provider": "ollama", "model": os.getenv("ML_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "math_reasoning_expert": {"provider": "ollama", "model": os.getenv("MATH_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "ml_expert": {"provider": "ollama", "model": os.getenv("ML_EXPERT_MODEL", "llama3.1:8b")},
+    "math_reasoning_expert": {"provider": "ollama", "model": os.getenv("MATH_EXPERT_MODEL", "deepseek-r1:8b")},
     "dl_expert": {"provider": "ollama", "model": os.getenv("DL_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "genai_expert": {"provider": "ollama", "model": os.getenv("GENAI_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "research_expert": {"provider": "ollama", "model": os.getenv("RESEARCH_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "agentic_ai_expert": {"provider": "ollama", "model": os.getenv("AGENTIC_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "rag_expert": {"provider": "ollama", "model": os.getenv("RAG_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "llm_eval_expert": {"provider": "ollama", "model": os.getenv("LLM_EVAL_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "genai_expert": {"provider": "ollama", "model": os.getenv("GENAI_EXPERT_MODEL", "qwen2.5:7b")},
+    "research_expert": {"provider": "ollama", "model": os.getenv("RESEARCH_EXPERT_MODEL", "mistral:7b")},
+    "agentic_ai_expert": {"provider": "ollama", "model": os.getenv("AGENTIC_EXPERT_MODEL", "llama3.1:8b")},
+    "rag_expert": {"provider": "ollama", "model": os.getenv("RAG_EXPERT_MODEL", "qwen2.5:7b")},
+    "llm_eval_expert": {"provider": "ollama", "model": os.getenv("LLM_EVAL_EXPERT_MODEL", "llama3.1:8b")},
     "friendly_conversation_expert": {"provider": "ollama", "model": os.getenv("FRIENDLY_EXPERT_MODEL", "phi3:mini")},
     "multimodal_expert": {"provider": "openai", "model": MULTIMODAL_OPENAI_MODEL},
     "gpt_fallback": {"provider": "openai", "model": OPENAI_FALLBACK_MODEL},
@@ -250,6 +262,119 @@ def session_file_path(user_id: str, session_id: str) -> Path:
 
 def long_memory_file_path(user_id: str) -> Path:
     return _user_memory_dir(user_id) / "long_memory.json"
+
+
+def user_docs_dir(user_id: str) -> Path:
+    path = _user_memory_dir(user_id) / "docs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def user_vector_index_path(user_id: str) -> Path:
+    return _user_memory_dir(user_id) / "rag_vectors.jsonl"
+
+
+def load_user_vectors(user_id: str) -> List[Dict[str, Any]]:
+    path = user_vector_index_path(user_id)
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def append_user_vectors(user_id: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path = user_vector_index_path(user_id)
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", name or "upload")
+    return cleaned[:120]
+
+
+def build_data_url(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    mime = mime or "application/octet-stream"
+    raw = path.read_bytes()
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('utf-8')}"
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    if fitz is None:
+        raise HTTPException(status_code=500, detail="PDF parsing unavailable. Install pymupdf.")
+    doc = fitz.open(path)
+    parts: List[str] = []
+    try:
+        for page in doc:
+            text = page.get_text("text")
+            if text:
+                parts.append(text)
+    finally:
+        doc.close()
+    return "\n".join(parts).strip()
+
+
+def image_to_text_with_vision(path: Path, user_prompt: str) -> str:
+    data_url = build_data_url(path)
+    prompt = (
+        "Extract all relevant text and key factual details from this image for question answering. "
+        "Be concise but complete.\n\n"
+        f"User prompt context: {user_prompt}"
+    )
+    resp = client.chat.completions.create(
+        model=MULTIMODAL_OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You convert images into concise, factual text context for retrieval."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def chunk_text(text: str, chunk_words: int = RAG_CHUNK_WORDS, overlap_words: int = RAG_CHUNK_OVERLAP) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+    chunks: List[str] = []
+    i = 0
+    step = max(1, chunk_words - overlap_words)
+    while i < len(words):
+        chunk = " ".join(words[i:i + chunk_words]).strip()
+        if chunk:
+            chunks.append(chunk)
+        i += step
+    return chunks
+
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    return [item.embedding for item in resp.data]
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    va = np.array(a, dtype=float)
+    vb = np.array(b, dtype=float)
+    denom = np.linalg.norm(va) * np.linalg.norm(vb)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(va, vb) / denom)
 
 
 def load_long_memory(user_id: str) -> List[Dict[str, Any]]:
@@ -599,6 +724,102 @@ async def memory_writer_agent(user_id: str, session_id: str, query: str, respons
         save_long_memory(user_id, existing)
     return {"stored": stored}
 
+
+async def file_ingestion_agent(user_id: str, session_id: str, user_prompt: str, files: List[UploadFile]) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    docs_dir = user_docs_dir(user_id)
+    for upload in files:
+        raw = await upload.read()
+        if not raw:
+            continue
+        original_name = safe_filename(upload.filename or "upload")
+        digest = hashlib.sha1(raw).hexdigest()[:10]
+        doc_id = f"{session_id}-{digest}"
+        saved_path = docs_dir / f"{doc_id}-{original_name}"
+        saved_path.write_bytes(raw)
+
+        lower_name = original_name.lower()
+        mime = upload.content_type or ""
+        extracted_text = ""
+        source_type = "text"
+        if lower_name.endswith(".pdf") or "pdf" in mime:
+            source_type = "pdf"
+            extracted_text = await asyncio.to_thread(extract_text_from_pdf, saved_path)
+        elif any(lower_name.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]) or mime.startswith("image/"):
+            source_type = "image"
+            extracted_text = await asyncio.to_thread(image_to_text_with_vision, saved_path, user_prompt)
+        else:
+            extracted_text = raw.decode("utf-8", errors="ignore")
+
+        if extracted_text.strip():
+            docs.append({
+                "doc_id": doc_id,
+                "file_name": original_name,
+                "source_type": source_type,
+                "text": extracted_text.strip(),
+            })
+    return docs
+
+
+async def chunking_agent(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    chunks: List[Dict[str, Any]] = []
+    for doc in documents:
+        for idx, chunk in enumerate(chunk_text(str(doc["text"]))):
+            chunks.append({
+                "doc_id": doc["doc_id"],
+                "file_name": doc["file_name"],
+                "source_type": doc["source_type"],
+                "chunk_id": f"{doc['doc_id']}-c{idx}",
+                "text": chunk,
+            })
+    return chunks
+
+
+async def embedding_agent(user_id: str, session_id: str, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    texts = [c["text"] for c in chunks]
+    vectors = await asyncio.to_thread(embed_texts, texts)
+    now = now_iso()
+    rows = []
+    for c, emb in zip(chunks, vectors):
+        rows.append({
+            "user_id": user_id,
+            "session_id": session_id,
+            "doc_id": c["doc_id"],
+            "file_name": c["file_name"],
+            "source_type": c["source_type"],
+            "chunk_id": c["chunk_id"],
+            "text": c["text"],
+            "embedding": emb,
+            "created_at": now,
+        })
+    await asyncio.to_thread(append_user_vectors, user_id, rows)
+    return {"stored_chunks": len(rows)}
+
+
+async def rag_retriever_agent(user_id: str, query: str, top_k: int = RAG_TOP_K) -> Dict[str, Any]:
+    rows = await asyncio.to_thread(load_user_vectors, user_id)
+    if not rows:
+        return {"chunks": [], "doc_ids": []}
+    query_embedding = (await asyncio.to_thread(embed_texts, [query]))[0]
+    scored: List[Dict[str, Any]] = []
+    for row in rows:
+        score = cosine_similarity(query_embedding, row.get("embedding", []))
+        scored.append({"score": score, "row": row})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:top_k]
+    chunks = []
+    doc_ids = []
+    for item in top:
+        row = item["row"]
+        chunks.append({
+            "doc_id": row.get("doc_id"),
+            "file_name": row.get("file_name"),
+            "text": row.get("text"),
+            "score": item["score"],
+        })
+        doc_ids.append(str(row.get("doc_id")))
+    return {"chunks": chunks, "doc_ids": sorted(list(set(doc_ids)))}
+
 USER_ID_PATTERN = r"^[a-zA-Z0-9_-]{3,64}$"
 PHONE_PATTERN = r"^\+?[1-9]\d{7,14}$"
 
@@ -631,6 +852,8 @@ class ChatResponse(BaseModel):
     fallback_reason: Optional[str] = None
     route_reason: Optional[str] = None
     latency_ms: Optional[int] = None
+    retrieved_chunks_count: Optional[int] = None
+    source_docs_used: List[str] = []
     agent_trace: List[AgentTraceItem] = []
 
 
@@ -751,6 +974,102 @@ def save_session_envelope(env: SessionEnvelope) -> None:
         json.dump(env.model_dump(), f, indent=2, ensure_ascii=False)
 
 
+async def execute_chat_pipeline(
+    *,
+    user_id: str,
+    session_id: str,
+    query: str,
+    session_env: SessionEnvelope,
+    image_urls: Optional[List[str]] = None,
+    rag_chunks: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    agent_trace: List[Dict[str, Any]] = []
+
+    planner_idx = start_agent_event(agent_trace, "PlannerAgent")
+    plan = await planner_agent(query, has_images=bool(image_urls))
+    end_agent_event(agent_trace, planner_idx, detail=f"expert_hint={plan.get('expert_hint')}")
+
+    router_idx = start_agent_event(agent_trace, "RouterAgent")
+    memory_idx = start_agent_event(agent_trace, "MemoryRetrieverAgent")
+    router_task = asyncio.create_task(
+        router_agent(
+            query,
+            retrieval_quality_label="medium",
+            has_images=bool(image_urls),
+        )
+    )
+    memory_task = asyncio.create_task(memory_retriever_agent(user_id, session_env, query))
+    router_decision, memory_result = await asyncio.gather(router_task, memory_task)
+    end_agent_event(
+        agent_trace,
+        router_idx,
+        detail=f"{router_decision.get('expert_label')} ({router_decision.get('confidence', 0):.2f})",
+    )
+    end_agent_event(
+        agent_trace,
+        memory_idx,
+        detail=f"session_tail={len(memory_result.get('session_tail', []))}, long_hits={len(memory_result.get('long_memory_hits', []))}",
+    )
+
+    guardrail_idx = start_agent_event(agent_trace, "GuardrailAgent")
+    guarded_memory = await guardrail_agent(memory_result)
+    end_agent_event(agent_trace, guardrail_idx, detail="sanitized memory context")
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": PERSONALITY}]
+    long_hits = guarded_memory.get("long_memory_hits", [])
+    if long_hits:
+        memory_lines = [f"- {hit.get('fact_text', '')}" for hit in long_hits[:MEMORY_RETRIEVAL_TOP_K]]
+        messages.append({
+            "role": "system",
+            "content": "Relevant long-term user memory:\n" + "\n".join(memory_lines),
+        })
+    if rag_chunks:
+        rag_lines = [f"- ({chunk.get('file_name','doc')}) {chunk.get('text','')}" for chunk in rag_chunks[:RAG_TOP_K]]
+        messages.append({
+            "role": "system",
+            "content": "Relevant uploaded document context:\n" + "\n".join(rag_lines),
+        })
+
+    messages.extend(guarded_memory.get("session_tail", []))
+    if image_urls:
+        user_content: List[Dict[str, Any]] = [{"type": "text", "text": query}]
+        for url in image_urls[:3]:
+            user_content.append({"type": "image_url", "image_url": {"url": url}})
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": query})
+
+    llm_idx = start_agent_event(agent_trace, "LLMExpertAgent", detail=router_decision.get("expert_label"))
+    gen = await asyncio.to_thread(generate_with_route, messages, router_decision)
+    end_agent_event(
+        agent_trace,
+        llm_idx,
+        detail=f"{gen.get('provider_used')}::{gen.get('model_used')} latency={gen.get('latency_ms')}ms",
+    )
+    assistant_response = gen["text"]
+
+    writer_idx = start_agent_event(agent_trace, "MemoryWriterAgent")
+    writer_result = await memory_writer_agent(user_id, session_id, query, assistant_response)
+    end_agent_event(agent_trace, writer_idx, detail=f"stored={writer_result.get('stored', 0)}")
+
+    if image_urls:
+        session_env.messages.append({"role": "user", "content": messages[-1]["content"]})
+    else:
+        session_env.messages.append({"role": "user", "content": query})
+    session_env.messages.append({"role": "assistant", "content": assistant_response})
+    save_session_envelope(session_env)
+
+    source_docs_used = sorted(list({str(c.get("doc_id")) for c in (rag_chunks or []) if c.get("doc_id")}))
+    return {
+        "assistant_response": assistant_response,
+        "router_decision": router_decision,
+        "generation": gen,
+        "agent_trace": agent_trace,
+        "retrieved_chunks_count": len(rag_chunks or []),
+        "source_docs_used": source_docs_used,
+    }
+
+
 
 @app.get("/")
 async def root():
@@ -868,7 +1187,6 @@ async def me(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    agent_trace: List[Dict[str, Any]] = []
     try:
         request_id = str(uuid.uuid4())
         user_id = current_user["user_id"]
@@ -878,65 +1196,18 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         if session_env.is_deleted:
             raise HTTPException(status_code=404, detail="Session is deleted. Restore it or start a new session.")
 
-        planner_idx = start_agent_event(agent_trace, "PlannerAgent")
-        plan = await planner_agent(request.message, has_images=bool(request.image_urls))
-        end_agent_event(agent_trace, planner_idx, detail=f"expert_hint={plan.get('expert_hint')}")
-
-        router_idx = start_agent_event(agent_trace, "RouterAgent")
-        memory_idx = start_agent_event(agent_trace, "MemoryRetrieverAgent")
-        router_task = asyncio.create_task(
-            router_agent(
-                request.message,
-                retrieval_quality_label="medium",
-                has_images=bool(request.image_urls),
-            )
+        result = await execute_chat_pipeline(
+            user_id=user_id,
+            session_id=session_id,
+            query=request.message,
+            session_env=session_env,
+            image_urls=request.image_urls,
+            rag_chunks=None,
         )
-        memory_task = asyncio.create_task(memory_retriever_agent(user_id, session_env, request.message))
-        router_decision, memory_result = await asyncio.gather(router_task, memory_task)
-        end_agent_event(
-            agent_trace,
-            router_idx,
-            detail=f"{router_decision.get('expert_label')} ({router_decision.get('confidence', 0):.2f})",
-        )
-        end_agent_event(
-            agent_trace,
-            memory_idx,
-            detail=f"session_tail={len(memory_result.get('session_tail', []))}, long_hits={len(memory_result.get('long_memory_hits', []))}",
-        )
-
-        guardrail_idx = start_agent_event(agent_trace, "GuardrailAgent")
-        guarded_memory = await guardrail_agent(memory_result)
-        end_agent_event(agent_trace, guardrail_idx, detail="sanitized memory context")
-
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": PERSONALITY}]
-        long_hits = guarded_memory.get("long_memory_hits", [])
-        if long_hits:
-            memory_lines = [f"- {hit.get('fact_text', '')}" for hit in long_hits[:MEMORY_RETRIEVAL_TOP_K]]
-            messages.append({
-                "role": "system",
-                "content": "Relevant long-term user memory:\n" + "\n".join(memory_lines),
-            })
-        messages.extend(guarded_memory.get("session_tail", []))
-        if request.image_urls:
-            user_content: List[Dict[str, Any]] = [{"type": "text", "text": request.message}]
-            for image_url in request.image_urls[:3]:
-                user_content.append({"type": "image_url", "image_url": {"url": image_url}})
-            messages.append({"role": "user", "content": user_content})
-        else:
-            messages.append({"role": "user", "content": request.message})
-
-        llm_idx = start_agent_event(agent_trace, "LLMExpertAgent", detail=router_decision.get("expert_label"))
-        gen = await asyncio.to_thread(generate_with_route, messages, router_decision)
-        end_agent_event(
-            agent_trace,
-            llm_idx,
-            detail=f"{gen.get('provider_used')}::{gen.get('model_used')} latency={gen.get('latency_ms')}ms",
-        )
-        assistant_response = gen["text"]
-
-        writer_idx = start_agent_event(agent_trace, "MemoryWriterAgent")
-        writer_result = await memory_writer_agent(user_id, session_id, request.message, assistant_response)
-        end_agent_event(agent_trace, writer_idx, detail=f"stored={writer_result.get('stored', 0)}")
+        router_decision = result["router_decision"]
+        gen = result["generation"]
+        assistant_response = result["assistant_response"]
+        agent_trace = result["agent_trace"]
 
         append_route_telemetry({
             "timestamp": now_iso(),
@@ -955,15 +1226,10 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             "fallback_reason": gen["fallback_reason"],
             "latency_ms": gen["latency_ms"],
             "success": True,
+            "retrieved_chunks_count": result["retrieved_chunks_count"],
+            "source_docs_used": result["source_docs_used"],
             "agent_trace": agent_trace,
         })
-
-        if request.image_urls:
-            session_env.messages.append({"role": "user", "content": messages[-1]["content"]})
-        else:
-            session_env.messages.append({"role": "user", "content": request.message})
-        session_env.messages.append({"role": "assistant", "content": assistant_response})
-        save_session_envelope(session_env)
 
         return ChatResponse(
             user_id=user_id,
@@ -978,6 +1244,8 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             fallback_reason=gen["fallback_reason"],
             route_reason=router_decision.get("reason"),
             latency_ms=gen["latency_ms"],
+            retrieved_chunks_count=result["retrieved_chunks_count"],
+            source_docs_used=result["source_docs_used"],
             agent_trace=agent_trace,
         )
     except Exception as e:
@@ -998,9 +1266,144 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             "latency_ms": None,
             "success": False,
             "error": str(e),
-            "agent_trace": agent_trace,
+            "agent_trace": [],
         })
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat/rag", response_model=ChatResponse)
+async def chat_with_files(
+    message: str = Form(...),
+    session_id: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    ingestion_trace: List[Dict[str, Any]] = []
+    try:
+        request_id = str(uuid.uuid4())
+        user_id = current_user["user_id"]
+        final_session_id = session_id or str(uuid.uuid4())
+        session_env = load_session_envelope(user_id, final_session_id)
+        if session_env.is_deleted:
+            raise HTTPException(status_code=404, detail="Session is deleted. Restore it or start a new session.")
+
+        docs: List[Dict[str, Any]] = []
+        rag_chunks: List[Dict[str, Any]] = []
+        source_docs_used: List[str] = []
+
+        if files:
+            ingestion_idx = start_agent_event(ingestion_trace, "FileIngestionAgent", detail=f"files={len(files)}")
+            docs = await file_ingestion_agent(user_id, final_session_id, message, files)
+            end_agent_event(ingestion_trace, ingestion_idx, detail=f"parsed_docs={len(docs)}")
+
+            chunk_idx = start_agent_event(ingestion_trace, "ChunkingAgent")
+            chunks = await chunking_agent(docs)
+            end_agent_event(ingestion_trace, chunk_idx, detail=f"chunks={len(chunks)}")
+
+            embed_idx = start_agent_event(ingestion_trace, "EmbeddingAgent")
+            emb_res = await embedding_agent(user_id, final_session_id, chunks)
+            end_agent_event(ingestion_trace, embed_idx, detail=f"stored_chunks={emb_res.get('stored_chunks', 0)}")
+
+        retrieve_idx = start_agent_event(ingestion_trace, "RAGRetrieverAgent")
+        rag_result = await rag_retriever_agent(user_id, message, top_k=RAG_TOP_K)
+        rag_chunks = rag_result.get("chunks", [])
+        source_docs_used = rag_result.get("doc_ids", [])
+        end_agent_event(ingestion_trace, retrieve_idx, detail=f"retrieved_chunks={len(rag_chunks)}")
+
+        result = await execute_chat_pipeline(
+            user_id=user_id,
+            session_id=final_session_id,
+            query=message,
+            session_env=session_env,
+            rag_chunks=rag_chunks,
+        )
+        router_decision = result["router_decision"]
+        gen = result["generation"]
+        assistant_response = result["assistant_response"]
+        agent_trace = ingestion_trace + result["agent_trace"]
+
+        append_route_telemetry({
+            "timestamp": now_iso(),
+            "request_id": request_id,
+            "user_id": user_id,
+            "session_id": final_session_id,
+            "query": message,
+            "router_label": router_decision["expert_label"],
+            "router_raw_label": router_decision["raw_expert_label"],
+            "router_confidence": router_decision["confidence"],
+            "route_provider": gen["provider_used"],
+            "route_model_alias": router_decision["model_route_alias"],
+            "route_reason": router_decision.get("reason"),
+            "runtime_model": gen["model_used"],
+            "fallback_triggered": bool(gen["fallback_triggered"] or router_decision["fallback_triggered"]),
+            "fallback_reason": gen["fallback_reason"],
+            "latency_ms": gen["latency_ms"],
+            "success": True,
+            "retrieved_chunks_count": len(rag_chunks),
+            "source_docs_used": source_docs_used,
+            "uploaded_docs_count": len(docs),
+            "agent_trace": agent_trace,
+        })
+
+        return ChatResponse(
+            user_id=user_id,
+            response=assistant_response,
+            session_id=final_session_id,
+            router_label=router_decision["expert_label"],
+            router_confidence=router_decision["confidence"],
+            route_provider=gen["provider_used"],
+            model_route_alias=router_decision["model_route_alias"],
+            runtime_model=gen["model_used"],
+            fallback_triggered=gen["fallback_triggered"] or router_decision["fallback_triggered"],
+            fallback_reason=gen["fallback_reason"],
+            route_reason=router_decision.get("reason"),
+            latency_ms=gen["latency_ms"],
+            retrieved_chunks_count=len(rag_chunks),
+            source_docs_used=source_docs_used,
+            agent_trace=agent_trace,
+        )
+    except Exception as e:
+        append_route_telemetry({
+            "timestamp": now_iso(),
+            "request_id": str(uuid.uuid4()),
+            "user_id": current_user.get("user_id", "unknown"),
+            "session_id": session_id,
+            "query": message,
+            "router_label": None,
+            "router_raw_label": None,
+            "router_confidence": None,
+            "route_provider": None,
+            "route_model_alias": None,
+            "runtime_model": None,
+            "fallback_triggered": None,
+            "fallback_reason": None,
+            "latency_ms": None,
+            "success": False,
+            "error": str(e),
+            "agent_trace": ingestion_trace,
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/experts")
+async def list_experts():
+    return {
+        "experts": EXPERT_TO_PROVIDER_ROUTE,
+        "config_env_keys": [
+            "ML_EXPERT_MODEL",
+            "MATH_EXPERT_MODEL",
+            "DL_EXPERT_MODEL",
+            "GENAI_EXPERT_MODEL",
+            "RESEARCH_EXPERT_MODEL",
+            "AGENTIC_EXPERT_MODEL",
+            "RAG_EXPERT_MODEL",
+            "LLM_EVAL_EXPERT_MODEL",
+            "FRIENDLY_EXPERT_MODEL",
+            "MULTIMODAL_OPENAI_MODEL",
+            "OPENAI_FALLBACK_MODEL",
+            "EMBEDDING_MODEL",
+        ],
+    }
 
 
 @app.get("/sessions")

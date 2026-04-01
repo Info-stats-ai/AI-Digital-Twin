@@ -1,1 +1,255 @@
-# AI-Digital-Twin
+# AI Digital Twin
+
+Production-oriented AI assistant with:
+- authenticated per-user memory
+- MoE-style expert routing
+- async agent orchestration for lower latency
+- telemetry for routing/evaluation
+- file-based RAG (`PDF` + `image`) with user-isolated retrieval
+
+## What This Project Is
+
+This project is an AI chatbot platform designed for "digital twin" behavior:
+- remembers important user context over time
+- routes each query to the most suitable expert model
+- supports both normal chat and document-assisted chat (RAG)
+- surfaces agent execution steps for observability
+
+Core backend is in `backend/server.py`, frontend chat UI in `frontend/components/twin.tsx`.
+
+## Why This Architecture
+
+Single-model chatbots are easy to build but hard to scale in production. They often become:
+- too expensive (always calling large models)
+- too slow (no routing or async orchestration)
+- hard to debug (no route/agent telemetry)
+- risky for privacy/compliance (weak memory boundaries)
+
+This project addresses those issues by combining:
+- expert routing (small model when possible, fallback when needed)
+- strict per-user memory isolation
+- async multi-agent pipeline
+- route and latency telemetry for continuous tuning
+
+## How It Works (High Level)
+
+### 1) Authentication + User Isolation
+- user logs in with JWT auth
+- every request is bound to `user_id`
+- memory, sessions, and document vectors are scoped by user
+
+### 2) Async Agent Pipeline
+For `/chat` and `/chat/rag`, backend runs a pipeline like:
+- `PlannerAgent`
+- `RouterAgent`
+- `MemoryRetrieverAgent`
+- `GuardrailAgent`
+- `LLMExpertAgent`
+- `MemoryWriterAgent`
+
+`RouterAgent` and `MemoryRetrieverAgent` run concurrently using `asyncio.gather(...)` to reduce end-to-end latency.
+
+### 3) Expert Routing (MoE-style)
+Queries are routed by:
+- LR router prediction + confidence threshold
+- heuristic override for expert-specific intents
+
+Expert routes are configured in `EXPERT_TO_PROVIDER_ROUTE` and exposed via `GET /experts`.
+
+### 4) Memory
+- short-term: session conversation turns
+- long-term: extracted important user facts (`long_memory.json`)
+- guardrail sanitization before context injection (basic email/phone redaction)
+
+### 5) File RAG (`/chat/rag`)
+User can upload PDF/image with prompt:
+- parse content (PDF text extraction, image-to-text)
+- chunk text
+- create embeddings
+- store vectors per-user
+- retrieve top-k relevant chunks for current query
+- inject retrieved context into expert LLM prompt
+
+## Expert Labels and Model Names
+
+Current expert labels:
+- `ml_expert`
+- `math_reasoning_expert`
+- `dl_expert`
+- `genai_expert`
+- `research_expert`
+- `agentic_ai_expert`
+- `rag_expert`
+- `llm_eval_expert`
+- `friendly_conversation_expert`
+- `multimodal_expert`
+
+Also used:
+- `memory_factual_expert`
+- `technical_expert`
+- `gpt_fallback`
+
+Model names are configured in environment variables and route map (`backend/server.py`).  
+You can inspect active mapping at runtime with:
+- `GET /experts`
+
+### Open-Source Expert Model Mapping (Ollama)
+
+Configured expert env vars and default OSS models:
+- `ML_EXPERT_MODEL=llama3.1:8b`
+- `MATH_EXPERT_MODEL=deepseek-r1:8b`
+- `DL_EXPERT_MODEL=qwen2.5-coder:7b-instruct`
+- `GENAI_EXPERT_MODEL=qwen2.5:7b`
+- `RESEARCH_EXPERT_MODEL=mistral:7b`
+- `AGENTIC_EXPERT_MODEL=llama3.1:8b`
+- `RAG_EXPERT_MODEL=qwen2.5:7b`
+- `LLM_EVAL_EXPERT_MODEL=llama3.1:8b`
+- `FRIENDLY_EXPERT_MODEL=phi3:mini`
+
+### Ollama Runtime Verification
+
+Ollama is installed and working on this machine.
+
+Verification command:
+```bash
+ollama --version
+ollama list
+```
+
+Expected model list includes:
+- `llama3.1:8b`
+- `deepseek-r1:8b`
+- `qwen2.5-coder:7b-instruct`
+- `qwen2.5:7b`
+- `mistral:7b`
+- `phi3:mini`
+
+## Is It Fast or Slow?
+
+Short answer: **moderately fast locally, but production speed depends on model choice and document size**.
+
+### Usually Fast
+- plain text chat with small local expert model
+- short context windows
+- no file ingestion
+
+### Usually Slower
+- fallback to larger cloud model
+- PDF/image ingestion + embedding on request path
+- large files, many chunks, high retrieval top-k
+
+### Main latency contributors
+- model inference time (largest factor)
+- document parsing/OCR
+- embedding API calls
+- context size sent to LLM
+
+## Production Challenges You Will Face
+
+### 1) Latency Spikes
+- file parsing + embedding in request path can increase p95 significantly
+- multimodal calls are usually slower than text-only
+
+Mitigation:
+- move ingestion to background jobs
+- cache doc parsing + embeddings
+- cap file size/pages and chunk count
+
+### 2) Cost Growth
+- fallback model usage can dominate spend
+- embedding many chunks per upload is expensive
+
+Mitigation:
+- enforce chunk and upload limits
+- tune router threshold with telemetry
+- add cost-aware routing policy
+
+### 3) Retrieval Quality Drift
+- noisy chunks reduce answer quality
+- stale or duplicate long-memory facts can pollute prompts
+
+Mitigation:
+- better chunking/reranking
+- memory dedup + decay
+- regular eval and hard-example retraining
+
+### 4) Privacy and Compliance Risk
+- accidental cross-user retrieval is critical severity
+- uploaded docs may contain PII/secrets
+
+Mitigation:
+- mandatory `user_id` filters in retrieval
+- PII scanning/redaction for storage and logs
+- encrypted storage and strict retention policies
+
+### 5) Reliability/Operations
+- local model runtime availability (Ollama) failures
+- external provider/API outages
+- uneven performance under concurrency
+
+Mitigation:
+- retries with backoff + circuit breaking
+- health checks and provider failover
+- rate limits and queue-based ingestion
+
+## Known Current Limitations
+
+- hybrid router (LR + heuristics), not a full neural gate yet
+- vector store is JSONL/file-based, not a production DB
+- basic sanitization only; needs stronger DLP/PII controls
+- no streaming token output yet
+- ingestion currently in request path (can increase latency)
+
+## Recommended Production Upgrades (Next Steps)
+
+1. Replace file-based vectors with `pgvector`/`Qdrant`
+2. Background ingestion workers (Celery/RQ/queue)
+3. Add reranker for top-k chunk quality
+4. Structured error codes + retry policies
+5. Strong observability dashboards (route, cost, p50/p95, fallback rate)
+6. Harden security (secrets manager, encryption at rest, audit trails)
+
+## Local Run
+
+### Backend
+```bash
+cd "/Users/omkarthakur/Desktop/Digital Twin/backend"
+source .venv/bin/activate
+uv pip install -r requirements.txt
+uvicorn server:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Ollama (required for local expert routes)
+```bash
+# terminal 1 (keep running)
+ollama serve
+
+# terminal 2 (one-time pulls)
+ollama pull llama3.1:8b
+ollama pull deepseek-r1:8b
+ollama pull qwen2.5-coder:7b-instruct
+ollama pull qwen2.5:7b
+ollama pull mistral:7b
+ollama pull phi3:mini
+```
+
+### Frontend
+```bash
+cd "/Users/omkarthakur/Desktop/Digital Twin/frontend"
+npm install
+npm run dev
+```
+
+Open:
+- `http://localhost:3000`
+
+## Useful Endpoints
+
+- `POST /auth/register`
+- `POST /auth/login`
+- `GET /auth/me`
+- `POST /chat` (text chat)
+- `POST /chat/rag` (prompt + PDF/image files)
+- `GET /experts` (expert -> provider/model mapping)
+- `GET /sessions`
+- `GET /memory/export`

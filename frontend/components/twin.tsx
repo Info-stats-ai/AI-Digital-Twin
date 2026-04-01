@@ -52,6 +52,8 @@ interface ChatApiResponse {
     response: string;
     session_id: string;
     agent_trace?: AgentTraceItem[];
+    source_docs_used?: string[];
+    retrieved_chunks_count?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -81,7 +83,7 @@ function isAuthResponse(data: unknown): data is AuthResponse {
 export default function Twin() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
-    const [imageUrl, setImageUrl] = useState('');
+    const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [sessionId, setSessionId] = useState<string>('');
     const [token, setToken] = useState<string>('');
@@ -239,18 +241,32 @@ export default function Twin() {
         }, 700);
 
         try {
-            const response = await fetch(`${API_BASE_URL}/chat`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                },
-                body: JSON.stringify({
-                    message: input,
-                    session_id: sessionId || undefined,
-                    image_urls: imageUrl.trim() ? [imageUrl.trim()] : undefined,
-                }),
-            });
+            let response: Response;
+            if (selectedFiles.length > 0) {
+                const formData = new FormData();
+                formData.append('message', input);
+                if (sessionId) formData.append('session_id', sessionId);
+                selectedFiles.forEach((file) => formData.append('files', file));
+                response = await fetch(`${API_BASE_URL}/chat/rag`, {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: formData,
+                });
+            } else {
+                response = await fetch(`${API_BASE_URL}/chat`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({
+                        message: input,
+                        session_id: sessionId || undefined,
+                    }),
+                });
+            }
 
             if (!response.ok) throw new Error('Failed to send message');
 
@@ -264,13 +280,15 @@ export default function Twin() {
             const assistantMessage: Message = {
                 id: (Date.now() + 1).toString(),
                 role: 'assistant',
-                content: data.response,
+                content: data.retrieved_chunks_count && data.retrieved_chunks_count > 0
+                    ? `${data.response}\n\n[Used ${data.retrieved_chunks_count} retrieved chunk(s) from uploaded docs]`
+                    : data.response,
                 timestamp: new Date(),
                 agentTrace: data.agent_trace,
             };
 
             setMessages(prev => [...prev, assistantMessage]);
-            setImageUrl('');
+            setSelectedFiles([]);
         } catch (error) {
             console.error('Error:', error);
             // Add error message
@@ -472,13 +490,18 @@ export default function Twin() {
             <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
                 <div className="mb-2">
                     <input
-                        type="url"
-                        value={imageUrl}
-                        onChange={(e) => setImageUrl(e.target.value)}
-                        placeholder="Optional image URL for multimodal queries"
+                        type="file"
+                        multiple
+                        accept=".pdf,image/*"
+                        onChange={(e) => setSelectedFiles(Array.from(e.target.files || []))}
                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-600 focus:border-transparent text-gray-800"
                         disabled={isLoading}
                     />
+                    {selectedFiles.length > 0 && (
+                        <p className="text-xs mt-1 text-slate-600">
+                            Attached: {selectedFiles.map((f) => f.name).join(', ')}
+                        </p>
+                    )}
                 </div>
                 <div className="flex gap-2">
                     <input
