@@ -20,6 +20,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import asyncio
 
 
 # Load environment variables
@@ -60,6 +61,8 @@ DEFAULT_OPENAI_MODEL = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", DEFAULT_OPENAI_MODEL)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "30"))
+MULTIMODAL_OPENAI_MODEL = os.getenv("MULTIMODAL_OPENAI_MODEL", "gpt-4.1-mini")
+MEMORY_RETRIEVAL_TOP_K = int(os.getenv("MEMORY_RETRIEVAL_TOP_K", "3"))
 
 # Memory directory
 MEMORY_DIR = Path("../memory")
@@ -80,7 +83,59 @@ PERSONALITY = load_personality()
 EXPERT_TO_PROVIDER_ROUTE = {
     "memory_factual_expert": {"provider": "ollama", "model": "phi3:mini"},
     "technical_expert": {"provider": "ollama", "model": "qwen2.5-coder:7b-instruct"},
+    "ml_expert": {"provider": "ollama", "model": os.getenv("ML_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "math_reasoning_expert": {"provider": "ollama", "model": os.getenv("MATH_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "dl_expert": {"provider": "ollama", "model": os.getenv("DL_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "genai_expert": {"provider": "ollama", "model": os.getenv("GENAI_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "research_expert": {"provider": "ollama", "model": os.getenv("RESEARCH_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "agentic_ai_expert": {"provider": "ollama", "model": os.getenv("AGENTIC_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "rag_expert": {"provider": "ollama", "model": os.getenv("RAG_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "llm_eval_expert": {"provider": "ollama", "model": os.getenv("LLM_EVAL_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
+    "friendly_conversation_expert": {"provider": "ollama", "model": os.getenv("FRIENDLY_EXPERT_MODEL", "phi3:mini")},
+    "multimodal_expert": {"provider": "openai", "model": MULTIMODAL_OPENAI_MODEL},
     "gpt_fallback": {"provider": "openai", "model": OPENAI_FALLBACK_MODEL},
+}
+
+EXPERT_KEYWORDS = {
+    "math_reasoning_expert": [
+        "solve", "equation", "integral", "derivative", "matrix", "algebra", "probability",
+        "statistics", "bayes", "calculus", "linear algebra", "optimization", "gradient", "theorem",
+    ],
+    "ml_expert": [
+        "machine learning", "sklearn", "xgboost", "random forest", "logistic regression",
+        "feature engineering", "cross validation", "roc", "classification report",
+    ],
+    "dl_expert": [
+        "deep learning", "neural network", "cnn", "rnn", "lstm", "transformer",
+        "backprop", "pytorch", "tensorflow", "fine-tune model weights",
+    ],
+    "genai_expert": [
+        "prompt engineering", "inference", "llm serving", "sft", "rlhf", "distillation",
+        "tokenization", "context window", "hallucination",
+    ],
+    "research_expert": [
+        "research paper", "paper summary", "methodology", "ablation", "sota", "benchmark",
+        "novelty", "limitations", "arxiv",
+    ],
+    "agentic_ai_expert": [
+        "agent", "tool calling", "workflow", "planner", "react pattern", "multi agent",
+        "orchestration", "autonomous",
+    ],
+    "rag_expert": [
+        "rag", "retrieval", "reranker", "embedding", "vector db", "chunking", "mrr",
+        "top-k", "hit@k", "grounded generation",
+    ],
+    "llm_eval_expert": [
+        "evaluation", "eval", "judge model", "latency", "cost", "accuracy", "macro f1",
+        "misroute", "threshold sweep", "benchmarking",
+    ],
+    "friendly_conversation_expert": [
+        "how are you", "hello", "hi", "good morning", "good evening", "thanks", "thank you",
+        "can we chat", "small talk", "tell me about yourself",
+    ],
+    "memory_factual_expert": [
+        "remember", "earlier", "previous", "my role", "my goals", "what did i say",
+    ],
 }
 
 router_model = None
@@ -193,6 +248,73 @@ def session_file_path(user_id: str, session_id: str) -> Path:
     return _user_memory_dir(user_id) / f"{session_id}.json"
 
 
+def long_memory_file_path(user_id: str) -> Path:
+    return _user_memory_dir(user_id) / "long_memory.json"
+
+
+def load_long_memory(user_id: str) -> List[Dict[str, Any]]:
+    path = long_memory_file_path(user_id)
+    if not path.exists():
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else []
+
+
+def save_long_memory(user_id: str, records: List[Dict[str, Any]]) -> None:
+    path = long_memory_file_path(user_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+
+
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9]+", text.lower())
+
+
+def memory_similarity(query: str, content: str) -> float:
+    q_tokens = set(tokenize(query))
+    c_tokens = set(tokenize(content))
+    if not q_tokens or not c_tokens:
+        return 0.0
+    overlap = len(q_tokens & c_tokens)
+    return overlap / max(1, len(q_tokens))
+
+
+def sanitize_text(text: str) -> str:
+    # Basic PII redaction before passing shared memory context to models.
+    redacted = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", text)
+    redacted = re.sub(r"\+?\d[\d\-\s]{7,}\d", "[redacted-phone]", redacted)
+    return redacted.strip()
+
+
+def extract_long_memory_facts(query: str, response: str) -> List[Dict[str, Any]]:
+    q = query.lower()
+    candidates = []
+    patterns = [
+        "my name is",
+        "i am",
+        "i'm",
+        "my role is",
+        "my goal is",
+        "i work on",
+        "i prefer",
+        "remember that",
+    ]
+    if any(p in q for p in patterns):
+        candidates.append({
+            "fact_text": sanitize_text(query),
+            "importance": 0.9,
+            "fact_type": "user_profile_or_preference",
+        })
+    if "goal" in q or "deadline" in q or "interview" in q:
+        candidates.append({
+            "fact_text": sanitize_text(query),
+            "importance": 0.85,
+            "fact_type": "user_goal",
+        })
+    return candidates
+
+
 def append_audit_log(action: str, user_id: str, session_id: Optional[str] = None, detail: Optional[str] = None) -> None:
     record = {
         "timestamp": now_iso(),
@@ -211,16 +333,41 @@ def append_route_telemetry(record: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[str, Any]:
+def select_heuristic_expert(query: str, has_images: bool = False) -> Optional[str]:
+    q = query.lower()
+    if has_images:
+        return "multimodal_expert"
+    # Ordered to prioritize task-specific experts before broad technical route.
+    ordered_experts = [
+        "memory_factual_expert",
+        "math_reasoning_expert",
+        "ml_expert",
+        "dl_expert",
+        "genai_expert",
+        "research_expert",
+        "agentic_ai_expert",
+        "rag_expert",
+        "llm_eval_expert",
+        "friendly_conversation_expert",
+    ]
+    for expert in ordered_experts:
+        if any(tok in q for tok in EXPERT_KEYWORDS[expert]):
+            return expert
+    return None
+
+
+def infer_router(query: str, retrieval_quality_label: str = "medium", has_images: bool = False) -> Dict[str, Any]:
     """Predict route using trained LR router; fallback to GPT route if unavailable/low confidence."""
+    heuristic_expert = select_heuristic_expert(query, has_images=has_images)
     if router_model is None:
-        route = EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"]
+        selected = heuristic_expert or "gpt_fallback"
+        route = EXPERT_TO_PROVIDER_ROUTE.get(selected, EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"])
         return {
-            "expert_label": "gpt_fallback",
+            "expert_label": selected,
             "raw_expert_label": "gpt_fallback",
-            "confidence": 0.0,
-            "fallback_triggered": True,
-            "reason": "router_not_loaded",
+            "confidence": 0.75 if heuristic_expert else 0.0,
+            "fallback_triggered": selected == "gpt_fallback",
+            "reason": "heuristic_no_router" if heuristic_expert else "router_not_loaded",
             "provider": route["provider"],
             "model_route_alias": route["model"],
         }
@@ -262,6 +409,15 @@ def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[st
 
     fallback_triggered = confidence < ROUTER_CONF_THRESHOLD
     final_expert = "gpt_fallback" if fallback_triggered else raw_expert
+    route_reason = "router_prediction"
+    if fallback_triggered:
+        route_reason = "router_low_confidence"
+
+    # Heuristic overrides let us support newly added experts before retraining the LR router.
+    if heuristic_expert:
+        final_expert = heuristic_expert
+        fallback_triggered = final_expert == "gpt_fallback"
+        route_reason = "heuristic_override"
 
     route = EXPERT_TO_PROVIDER_ROUTE.get(final_expert, EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"])
     return {
@@ -269,6 +425,7 @@ def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[st
         "raw_expert_label": raw_expert,
         "confidence": confidence,
         "fallback_triggered": fallback_triggered,
+        "reason": route_reason,
         "provider": route["provider"],
         "model_route_alias": route["model"],
         "features": {
@@ -284,16 +441,37 @@ def infer_router(query: str, retrieval_quality_label: str = "medium") -> Dict[st
     }
 
 
-def ollama_chat(model: str, messages: List[Dict[str, str]]) -> str:
+def normalize_messages_for_ollama(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for msg in messages:
+        role = str(msg.get("role", "user"))
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            normalized.append({"role": role, "content": content})
+            continue
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+            normalized.append({"role": role, "content": " ".join(text_parts).strip()})
+            continue
+        normalized.append({"role": role, "content": str(content)})
+    return normalized
+
+
+def ollama_chat(model: str, messages: List[Dict[str, Any]]) -> str:
     url = f"{OLLAMA_BASE_URL}/api/chat"
-    payload = {"model": model, "messages": messages, "stream": False}
+    payload = {"model": model, "messages": normalize_messages_for_ollama(messages), "stream": False}
     resp = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT_SEC)
     resp.raise_for_status()
     data = resp.json()
     return data["message"]["content"]
 
 
-def generate_with_route(messages: List[Dict[str, str]], router_decision: Dict[str, Any]) -> Dict[str, Any]:
+def generate_with_route(messages: List[Dict[str, Any]], router_decision: Dict[str, Any]) -> Dict[str, Any]:
     provider = router_decision["provider"]
     model = router_decision["model_route_alias"]
     start = time.time()
@@ -328,6 +506,99 @@ def generate_with_route(messages: List[Dict[str, str]], router_decision: Dict[st
             "fallback_reason": fallback_reason,
         }
 
+
+def start_agent_event(trace: List[Dict[str, Any]], agent: str, detail: Optional[str] = None) -> int:
+    trace.append({
+        "agent": agent,
+        "status": "running",
+        "started_at": now_iso(),
+        "ended_at": None,
+        "detail": detail,
+    })
+    return len(trace) - 1
+
+
+def end_agent_event(trace: List[Dict[str, Any]], idx: int, status: str = "completed", detail: Optional[str] = None) -> None:
+    trace[idx]["status"] = status
+    trace[idx]["ended_at"] = now_iso()
+    if detail:
+        trace[idx]["detail"] = detail
+
+
+async def planner_agent(query: str, has_images: bool) -> Dict[str, Any]:
+    hint = select_heuristic_expert(query, has_images=has_images)
+    return {
+        "expert_hint": hint,
+        "needs_memory": True,
+        "has_images": has_images,
+    }
+
+
+async def router_agent(query: str, retrieval_quality_label: str, has_images: bool) -> Dict[str, Any]:
+    return await asyncio.to_thread(
+        infer_router,
+        query,
+        retrieval_quality_label,
+        has_images,
+    )
+
+
+async def memory_retriever_agent(user_id: str, session_env: "SessionEnvelope", query: str) -> Dict[str, Any]:
+    session_tail = session_env.messages[-6:] if len(session_env.messages) > 6 else session_env.messages
+    long_mem = load_long_memory(user_id)
+    scored = []
+    for item in long_mem:
+        content = str(item.get("fact_text", ""))
+        scored.append((memory_similarity(query, content), item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_long = [row for score, row in scored if score > 0][:MEMORY_RETRIEVAL_TOP_K]
+    return {
+        "session_tail": session_tail,
+        "long_memory_hits": top_long,
+    }
+
+
+async def guardrail_agent(memory_result: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized_hits = []
+    for hit in memory_result.get("long_memory_hits", []):
+        copied = dict(hit)
+        copied["fact_text"] = sanitize_text(str(hit.get("fact_text", "")))
+        sanitized_hits.append(copied)
+    return {
+        "session_tail": memory_result.get("session_tail", []),
+        "long_memory_hits": sanitized_hits,
+    }
+
+
+async def memory_writer_agent(user_id: str, session_id: str, query: str, response: str) -> Dict[str, Any]:
+    candidates = extract_long_memory_facts(query, response)
+    if not candidates:
+        return {"stored": 0}
+
+    existing = load_long_memory(user_id)
+    existing_texts = {str(item.get("fact_text", "")).strip().lower() for item in existing}
+    stored = 0
+    for cand in candidates:
+        fact_text = str(cand["fact_text"]).strip()
+        if not fact_text or fact_text.lower() in existing_texts:
+            continue
+        existing.append({
+            "memory_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "session_id": session_id,
+            "fact_text": fact_text,
+            "fact_type": cand["fact_type"],
+            "importance": cand["importance"],
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        })
+        existing_texts.add(fact_text.lower())
+        stored += 1
+
+    if stored:
+        save_long_memory(user_id, existing)
+    return {"stored": stored}
+
 USER_ID_PATTERN = r"^[a-zA-Z0-9_-]{3,64}$"
 PHONE_PATTERN = r"^\+?[1-9]\d{7,14}$"
 
@@ -336,6 +607,15 @@ PHONE_PATTERN = r"^\+?[1-9]\d{7,14}$"
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+
+
+class AgentTraceItem(BaseModel):
+    agent: str
+    status: str
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    detail: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -349,7 +629,9 @@ class ChatResponse(BaseModel):
     runtime_model: Optional[str] = None
     fallback_triggered: Optional[bool] = None
     fallback_reason: Optional[str] = None
+    route_reason: Optional[str] = None
     latency_ms: Optional[int] = None
+    agent_trace: List[AgentTraceItem] = []
 
 
 class SessionEnvelope(BaseModel):
@@ -361,7 +643,7 @@ class SessionEnvelope(BaseModel):
     deleted_at: Optional[str] = None
     deleted_by: Optional[str] = None
     delete_reason: Optional[str] = None
-    messages: List[Dict[str, str]] = []
+    messages: List[Dict[str, Any]] = []
 
 
 class RegisterRequest(BaseModel):
@@ -586,6 +868,7 @@ async def me(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    agent_trace: List[Dict[str, Any]] = []
     try:
         request_id = str(uuid.uuid4())
         user_id = current_user["user_id"]
@@ -595,13 +878,65 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         if session_env.is_deleted:
             raise HTTPException(status_code=404, detail="Session is deleted. Restore it or start a new session.")
 
-        messages = [{"role": "system", "content": PERSONALITY}]
-        messages.extend(session_env.messages)
-        messages.append({"role": "user", "content": request.message})
+        planner_idx = start_agent_event(agent_trace, "PlannerAgent")
+        plan = await planner_agent(request.message, has_images=bool(request.image_urls))
+        end_agent_event(agent_trace, planner_idx, detail=f"expert_hint={plan.get('expert_hint')}")
 
-        router_decision = infer_router(request.message, retrieval_quality_label="medium")
-        gen = generate_with_route(messages=messages, router_decision=router_decision)
+        router_idx = start_agent_event(agent_trace, "RouterAgent")
+        memory_idx = start_agent_event(agent_trace, "MemoryRetrieverAgent")
+        router_task = asyncio.create_task(
+            router_agent(
+                request.message,
+                retrieval_quality_label="medium",
+                has_images=bool(request.image_urls),
+            )
+        )
+        memory_task = asyncio.create_task(memory_retriever_agent(user_id, session_env, request.message))
+        router_decision, memory_result = await asyncio.gather(router_task, memory_task)
+        end_agent_event(
+            agent_trace,
+            router_idx,
+            detail=f"{router_decision.get('expert_label')} ({router_decision.get('confidence', 0):.2f})",
+        )
+        end_agent_event(
+            agent_trace,
+            memory_idx,
+            detail=f"session_tail={len(memory_result.get('session_tail', []))}, long_hits={len(memory_result.get('long_memory_hits', []))}",
+        )
+
+        guardrail_idx = start_agent_event(agent_trace, "GuardrailAgent")
+        guarded_memory = await guardrail_agent(memory_result)
+        end_agent_event(agent_trace, guardrail_idx, detail="sanitized memory context")
+
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": PERSONALITY}]
+        long_hits = guarded_memory.get("long_memory_hits", [])
+        if long_hits:
+            memory_lines = [f"- {hit.get('fact_text', '')}" for hit in long_hits[:MEMORY_RETRIEVAL_TOP_K]]
+            messages.append({
+                "role": "system",
+                "content": "Relevant long-term user memory:\n" + "\n".join(memory_lines),
+            })
+        messages.extend(guarded_memory.get("session_tail", []))
+        if request.image_urls:
+            user_content: List[Dict[str, Any]] = [{"type": "text", "text": request.message}]
+            for image_url in request.image_urls[:3]:
+                user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+            messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": request.message})
+
+        llm_idx = start_agent_event(agent_trace, "LLMExpertAgent", detail=router_decision.get("expert_label"))
+        gen = await asyncio.to_thread(generate_with_route, messages, router_decision)
+        end_agent_event(
+            agent_trace,
+            llm_idx,
+            detail=f"{gen.get('provider_used')}::{gen.get('model_used')} latency={gen.get('latency_ms')}ms",
+        )
         assistant_response = gen["text"]
+
+        writer_idx = start_agent_event(agent_trace, "MemoryWriterAgent")
+        writer_result = await memory_writer_agent(user_id, session_id, request.message, assistant_response)
+        end_agent_event(agent_trace, writer_idx, detail=f"stored={writer_result.get('stored', 0)}")
 
         append_route_telemetry({
             "timestamp": now_iso(),
@@ -614,14 +949,19 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             "router_confidence": router_decision["confidence"],
             "route_provider": gen["provider_used"],
             "route_model_alias": router_decision["model_route_alias"],
+            "route_reason": router_decision.get("reason"),
             "runtime_model": gen["model_used"],
             "fallback_triggered": bool(gen["fallback_triggered"] or router_decision["fallback_triggered"]),
             "fallback_reason": gen["fallback_reason"],
             "latency_ms": gen["latency_ms"],
             "success": True,
+            "agent_trace": agent_trace,
         })
 
-        session_env.messages.append({"role": "user", "content": request.message})
+        if request.image_urls:
+            session_env.messages.append({"role": "user", "content": messages[-1]["content"]})
+        else:
+            session_env.messages.append({"role": "user", "content": request.message})
         session_env.messages.append({"role": "assistant", "content": assistant_response})
         save_session_envelope(session_env)
 
@@ -636,7 +976,9 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             runtime_model=gen["model_used"],
             fallback_triggered=gen["fallback_triggered"] or router_decision["fallback_triggered"],
             fallback_reason=gen["fallback_reason"],
+            route_reason=router_decision.get("reason"),
             latency_ms=gen["latency_ms"],
+            agent_trace=agent_trace,
         )
     except Exception as e:
         append_route_telemetry({
@@ -656,6 +998,7 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             "latency_ms": None,
             "success": False,
             "error": str(e),
+            "agent_trace": agent_trace,
         })
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -8,6 +8,7 @@ interface Message {
     role: 'user' | 'assistant';
     content: string;
     timestamp: Date;
+    agentTrace?: AgentTraceItem[];
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
@@ -39,6 +40,20 @@ interface UserProfile {
     phone?: string;
 }
 
+interface AgentTraceItem {
+    agent: string;
+    status: string;
+    started_at?: string;
+    ended_at?: string;
+    detail?: string;
+}
+
+interface ChatApiResponse {
+    response: string;
+    session_id: string;
+    agent_trace?: AgentTraceItem[];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null;
 }
@@ -66,6 +81,7 @@ function isAuthResponse(data: unknown): data is AuthResponse {
 export default function Twin() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
+    const [imageUrl, setImageUrl] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [sessionId, setSessionId] = useState<string>('');
     const [token, setToken] = useState<string>('');
@@ -79,6 +95,7 @@ export default function Twin() {
     const [authError, setAuthError] = useState('');
     const [isAuthLoading, setIsAuthLoading] = useState(false);
     const [authInfo, setAuthInfo] = useState('');
+    const [executingAgent, setExecutingAgent] = useState<string>('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -206,6 +223,20 @@ export default function Twin() {
         setMessages(prev => [...prev, userMessage]);
         setInput('');
         setIsLoading(true);
+        const executionSteps = [
+            'PlannerAgent',
+            'RouterAgent',
+            'MemoryRetrieverAgent',
+            'GuardrailAgent',
+            'LLMExpertAgent',
+            'MemoryWriterAgent',
+        ];
+        let stepIdx = 0;
+        setExecutingAgent(executionSteps[stepIdx]);
+        const stepTimer = setInterval(() => {
+            stepIdx = (stepIdx + 1) % executionSteps.length;
+            setExecutingAgent(executionSteps[stepIdx]);
+        }, 700);
 
         try {
             const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -217,12 +248,13 @@ export default function Twin() {
                 body: JSON.stringify({
                     message: input,
                     session_id: sessionId || undefined,
+                    image_urls: imageUrl.trim() ? [imageUrl.trim()] : undefined,
                 }),
             });
 
             if (!response.ok) throw new Error('Failed to send message');
 
-            const data = await response.json();
+            const data: ChatApiResponse = await response.json();
 
             if (!sessionId) {
                 setSessionId(data.session_id);
@@ -234,9 +266,11 @@ export default function Twin() {
                 role: 'assistant',
                 content: data.response,
                 timestamp: new Date(),
+                agentTrace: data.agent_trace,
             };
 
             setMessages(prev => [...prev, assistantMessage]);
+            setImageUrl('');
         } catch (error) {
             console.error('Error:', error);
             // Add error message
@@ -248,6 +282,8 @@ export default function Twin() {
             };
             setMessages(prev => [...prev, errorMessage]);
         } finally {
+            clearInterval(stepTimer);
+            setExecutingAgent('');
             setIsLoading(false);
         }
     };
@@ -390,6 +426,11 @@ export default function Twin() {
                             >
                                 {message.timestamp.toLocaleTimeString()}
                             </p>
+                            {message.role === 'assistant' && message.agentTrace && message.agentTrace.length > 0 && (
+                                <p className="text-xs mt-2 text-slate-500">
+                                    Agents: {message.agentTrace.map((a) => `${a.agent}(${a.status})`).join(' -> ')}
+                                </p>
+                            )}
                         </div>
 
                         {message.role === 'user' && (
@@ -415,6 +456,11 @@ export default function Twin() {
                                 <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-100" />
                                 <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-200" />
                             </div>
+                            {executingAgent && (
+                                <p className="text-xs mt-2 text-slate-600">
+                                    Executing: {executingAgent}
+                                </p>
+                            )}
                         </div>
                     </div>
                 )}
@@ -424,6 +470,16 @@ export default function Twin() {
 
             {/* Input */}
             <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
+                <div className="mb-2">
+                    <input
+                        type="url"
+                        value={imageUrl}
+                        onChange={(e) => setImageUrl(e.target.value)}
+                        placeholder="Optional image URL for multimodal queries"
+                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-600 focus:border-transparent text-gray-800"
+                        disabled={isLoading}
+                    />
+                </div>
                 <div className="flex gap-2">
                     <input
                         type="text"
