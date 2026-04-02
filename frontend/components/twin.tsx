@@ -51,9 +51,16 @@ interface AgentTraceItem {
 interface ChatApiResponse {
     response: string;
     session_id: string;
+    request_id?: string;
     agent_trace?: AgentTraceItem[];
     source_docs_used?: string[];
     retrieved_chunks_count?: number;
+}
+
+interface ProgressApiResponse {
+    request_id: string;
+    done: boolean;
+    events: AgentTraceItem[];
 }
 
 function getApiBaseUrl(): string {
@@ -235,27 +242,31 @@ export default function Twin() {
         setMessages(prev => [...prev, userMessage]);
         setInput('');
         setIsLoading(true);
-        const executionSteps = [
-            'PlannerAgent',
-            'RouterAgent',
-            'MemoryRetrieverAgent',
-            'GuardrailAgent',
-            'LLMExpertAgent',
-            'MemoryWriterAgent',
-        ];
-        let stepIdx = 0;
-        setExecutingAgent(executionSteps[stepIdx]);
-        const stepTimer = setInterval(() => {
-            stepIdx = (stepIdx + 1) % executionSteps.length;
-            setExecutingAgent(executionSteps[stepIdx]);
-        }, 700);
+        const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        setExecutingAgent('PlannerAgent');
+        let pollTimer: ReturnType<typeof setInterval> | null = null;
 
         try {
             const apiBaseUrl = getApiBaseUrl();
+            pollTimer = setInterval(async () => {
+                try {
+                    const progressResp = await fetch(`${apiBaseUrl}/chat/progress/${requestId}`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (!progressResp.ok) return;
+                    const progress: ProgressApiResponse = await progressResp.json();
+                    const last = progress.events[progress.events.length - 1];
+                    if (last?.agent) setExecutingAgent(last.agent);
+                    if (progress.done && pollTimer) clearInterval(pollTimer);
+                } catch {
+                    // best-effort progress polling
+                }
+            }, 500);
             let response: Response;
             if (selectedFiles.length > 0) {
                 const formData = new FormData();
                 formData.append('message', input);
+                formData.append('request_id', requestId);
                 if (sessionId) formData.append('session_id', sessionId);
                 selectedFiles.forEach((file) => formData.append('files', file));
                 response = await fetch(`${apiBaseUrl}/chat/rag`, {
@@ -275,6 +286,7 @@ export default function Twin() {
                     body: JSON.stringify({
                         message: input,
                         session_id: sessionId || undefined,
+                        request_id: requestId,
                     }),
                 });
             }
@@ -311,7 +323,7 @@ export default function Twin() {
             };
             setMessages(prev => [...prev, errorMessage]);
         } finally {
-            clearInterval(stepTimer);
+            if (pollTimer) clearInterval(pollTimer);
             setExecutingAgent('');
             setIsLoading(false);
         }

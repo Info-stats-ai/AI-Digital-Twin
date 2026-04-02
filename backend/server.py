@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, EmailStr, model_validator
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TypedDict, Callable, Awaitable
 import json
 import uuid
 from pathlib import Path
@@ -24,6 +24,10 @@ import asyncio
 import base64
 import mimetypes
 import hashlib
+import torch
+import torch.nn as nn
+from sentence_transformers import SentenceTransformer
+from langgraph.graph import StateGraph, END
 
 try:
     import fitz  # PyMuPDF
@@ -69,6 +73,9 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "no-reply@digitaltwin.local")
 ROUTER_MODEL_PATH = os.getenv("ROUTER_MODEL_PATH", "../artifacts/router_tfidf_lr.pkl")
 ROUTER_META_PATH = os.getenv("ROUTER_META_PATH", "../artifacts/router_meta.json")
+ROUTER_BACKEND = os.getenv("ROUTER_BACKEND", "neural").lower()
+ROUTER_NEURAL_PATH = os.getenv("ROUTER_NEURAL_PATH", "../artifacts/router_neural_moe.pt")
+ROUTER_NEURAL_META_PATH = os.getenv("ROUTER_NEURAL_META_PATH", "../artifacts/router_neural_moe_meta.json")
 ROUTER_CONF_THRESHOLD = float(os.getenv("ROUTER_CONF_THRESHOLD", "0.62"))
 DEFAULT_OPENAI_MODEL = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", DEFAULT_OPENAI_MODEL)
@@ -80,6 +87,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 RAG_CHUNK_WORDS = int(os.getenv("RAG_CHUNK_WORDS", "180"))
 RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "40"))
+INGESTION_QUEUE_ENABLED = os.getenv("INGESTION_QUEUE_ENABLED", "true").lower() in {"1", "true", "yes"}
 
 # Memory directory
 MEMORY_DIR = Path("../memory")
@@ -87,6 +95,12 @@ MEMORY_DIR.mkdir(exist_ok=True)
 USERS_FILE = MEMORY_DIR / "users.json"
 AUDIT_FILE = MEMORY_DIR / "audit.log"
 ROUTE_TELEMETRY_FILE = MEMORY_DIR / "route_telemetry.jsonl"
+
+# In-memory progress + ingestion queue state (single-process dev/prototype runtime).
+PROGRESS_STATE: Dict[str, Dict[str, Any]] = {}
+INGESTION_JOBS: Dict[str, Dict[str, Any]] = {}
+INGESTION_QUEUE: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+AGENT_METRICS: Dict[str, Dict[str, float]] = {}
 
 
 # Load personality details
@@ -155,19 +169,112 @@ EXPERT_KEYWORDS = {
     ],
 }
 
+class NeuralRouterNet(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 router_model = None
 router_meta: Optional[Dict[str, Any]] = None
+router_neural: Optional[Dict[str, Any]] = None
+
 try:
     router_model = joblib.load(ROUTER_MODEL_PATH)
     with open(ROUTER_META_PATH, "r", encoding="utf-8") as f:
         router_meta = json.load(f)
-    print(f"[router] loaded model from {ROUTER_MODEL_PATH}")
+    print(f"[router-lr] loaded model from {ROUTER_MODEL_PATH}")
 except Exception as e:
-    print(f"[router] not loaded, fallback mode active: {e}")
+    print(f"[router-lr] not loaded: {e}")
+
+try:
+    ckpt = torch.load(ROUTER_NEURAL_PATH, map_location="cpu")
+    label_classes = [str(c) for c in ckpt["label_classes"]]
+    input_dim = int(ckpt["input_dim"])
+    encoder_model_name = str(ckpt.get("encoder_model", "sentence-transformers/all-MiniLM-L6-v2"))
+    feature_order = ckpt.get(
+        "feature_order",
+        [
+            "contains_code",
+            "error_log_present",
+            "memory_needed",
+            "multi_hop",
+            "has_image",
+            "has_pdf",
+            "estimated_input_tokens_norm",
+            "latency_budget_ms_norm",
+            "difficulty_norm",
+            "retrieval_quality_norm",
+        ],
+    )
+
+    net = NeuralRouterNet(input_dim=input_dim, num_classes=len(label_classes))
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    encoder = SentenceTransformer(encoder_model_name)
+
+    neural_meta: Dict[str, Any] = {}
+    if Path(ROUTER_NEURAL_META_PATH).exists():
+        with open(ROUTER_NEURAL_META_PATH, "r", encoding="utf-8") as f:
+            neural_meta = json.load(f)
+
+    router_neural = {
+        "model": net,
+        "encoder": encoder,
+        "classes": label_classes,
+        "feature_order": feature_order,
+        "meta": neural_meta,
+    }
+    print(f"[router-neural] loaded model from {ROUTER_NEURAL_PATH}")
+except Exception as e:
+    print(f"[router-neural] not loaded: {e}")
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def progress_init(request_id: str, user_id: str) -> None:
+    PROGRESS_STATE[request_id] = {
+        "user_id": user_id,
+        "events": [],
+        "done": False,
+        "updated_at": now_iso(),
+    }
+
+
+def progress_emit(request_id: str, agent: str, status: str, detail: Optional[str] = None) -> None:
+    state = PROGRESS_STATE.get(request_id)
+    if not state:
+        return
+    state["events"].append(
+        {
+            "agent": agent,
+            "status": status,
+            "detail": detail,
+            "timestamp": now_iso(),
+        }
+    )
+    state["updated_at"] = now_iso()
+
+
+def progress_done(request_id: str) -> None:
+    state = PROGRESS_STATE.get(request_id)
+    if not state:
+        return
+    state["done"] = True
+    state["updated_at"] = now_iso()
 
 
 def load_users() -> List[Dict[str, Any]]:
@@ -463,6 +570,80 @@ def append_route_telemetry(record: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def build_router_features(query: str, retrieval_quality_label: str = "medium", has_images: bool = False) -> Dict[str, Any]:
+    q_lower = query.lower()
+    contains_code = int(any(tok in q_lower for tok in ["traceback", "exception", "error", "code", "python", "npm", "fastapi", "tsx", "{", "}"]))
+    error_log_present = int(any(tok in q_lower for tok in ["traceback", "exception", "error:", "failed", "module not found"]))
+    memory_needed = int(any(tok in q_lower for tok in ["remember", "earlier", "previous", "my role", "my goals", "what did i say"]))
+    multi_hop = int(any(tok in q_lower for tok in ["compare", "tradeoff", "strategy", "roadmap", "analyze", "design"]))
+    has_pdf = int("pdf" in q_lower or "document" in q_lower or "paper" in q_lower)
+    has_image = int(has_images or any(tok in q_lower for tok in ["image", "screenshot", "diagram", "figure", "photo"]))
+
+    estimated_tokens = max(20, min(500, int(len(query.split()) * 1.5)))
+    if estimated_tokens < 80:
+        difficulty = "easy"
+        latency_budget_ms = 900
+    elif estimated_tokens < 180:
+        difficulty = "med"
+        latency_budget_ms = 1800
+    else:
+        difficulty = "hard"
+        latency_budget_ms = 3000
+
+    return {
+        "contains_code": contains_code,
+        "error_log_present": error_log_present,
+        "memory_needed": memory_needed,
+        "multi_hop": multi_hop,
+        "has_image": has_image,
+        "has_pdf": has_pdf,
+        "estimated_input_tokens": estimated_tokens,
+        "difficulty": difficulty,
+        "retrieval_quality_label": retrieval_quality_label,
+        "latency_budget_ms": latency_budget_ms,
+    }
+
+
+def infer_router_neural(query: str, retrieval_quality_label: str = "medium", has_images: bool = False) -> Optional[Dict[str, Any]]:
+    if router_neural is None:
+        return None
+    features = build_router_features(query, retrieval_quality_label, has_images)
+    difficulty_map = {"easy": 0.0, "med": 0.5, "hard": 1.0}
+    retrieval_map = {"low": 0.0, "medium": 0.5, "high": 1.0}
+
+    text_emb = router_neural["encoder"].encode([query], normalize_embeddings=True)[0]
+    numeric = np.array(
+        [
+            float(features["contains_code"]),
+            float(features["error_log_present"]),
+            float(features["memory_needed"]),
+            float(features["multi_hop"]),
+            float(features["has_image"]),
+            float(features["has_pdf"]),
+            float(features["estimated_input_tokens"]) / 600.0,
+            float(features["latency_budget_ms"]) / 3000.0,
+            difficulty_map.get(str(features["difficulty"]), 0.5),
+            retrieval_map.get(str(features["retrieval_quality_label"]), 0.5),
+        ],
+        dtype=np.float32,
+    )
+    x = np.concatenate([text_emb.astype(np.float32), numeric], axis=0)
+    x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = router_neural["model"](x_tensor)
+        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+    idx = int(np.argmax(probs))
+    raw_expert = str(router_neural["classes"][idx])
+    confidence = float(probs[idx])
+
+    return {
+        "raw_expert_label": raw_expert,
+        "confidence": confidence,
+        "features": features,
+    }
+
+
 def select_heuristic_expert(query: str, has_images: bool = False) -> Optional[str]:
     q = query.lower()
     if has_images:
@@ -487,9 +668,12 @@ def select_heuristic_expert(query: str, has_images: bool = False) -> Optional[st
 
 
 def infer_router(query: str, retrieval_quality_label: str = "medium", has_images: bool = False) -> Dict[str, Any]:
-    """Predict route using trained LR router; fallback to GPT route if unavailable/low confidence."""
+    """Predict route using configured backend (neural/lr); fallback if unavailable/low confidence."""
     heuristic_expert = select_heuristic_expert(query, has_images=has_images)
-    if router_model is None:
+    neural_candidate = infer_router_neural(query, retrieval_quality_label, has_images) if ROUTER_BACKEND == "neural" else None
+    lr_available = router_model is not None
+
+    if neural_candidate is None and not lr_available:
         selected = heuristic_expert or "gpt_fallback"
         route = EXPERT_TO_PROVIDER_ROUTE.get(selected, EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"])
         return {
@@ -497,57 +681,47 @@ def infer_router(query: str, retrieval_quality_label: str = "medium", has_images
             "raw_expert_label": "gpt_fallback",
             "confidence": 0.75 if heuristic_expert else 0.0,
             "fallback_triggered": selected == "gpt_fallback",
-            "reason": "heuristic_no_router" if heuristic_expert else "router_not_loaded",
+            "reason": "heuristic_no_router" if heuristic_expert else "router_not_loaded_any_backend",
             "provider": route["provider"],
             "model_route_alias": route["model"],
         }
 
-    q_lower = query.lower()
-    contains_code = int(any(tok in q_lower for tok in ["traceback", "exception", "error", "code", "python", "npm", "fastapi", "tsx", "{", "}"]))
-    error_log_present = int(any(tok in q_lower for tok in ["traceback", "exception", "error:", "failed", "module not found"]))
-    memory_needed = int(any(tok in q_lower for tok in ["remember", "earlier", "previous", "my role", "my goals", "what did i say"]))
-    multi_hop = int(any(tok in q_lower for tok in ["compare", "tradeoff", "strategy", "roadmap", "analyze", "design"]))
-
-    estimated_tokens = max(20, min(500, int(len(query.split()) * 1.5)))
-    if estimated_tokens < 80:
-        difficulty = "easy"
-        latency_budget_ms = 900
-    elif estimated_tokens < 180:
-        difficulty = "med"
-        latency_budget_ms = 1800
+    if neural_candidate is not None:
+        raw_expert = str(neural_candidate["raw_expert_label"])
+        confidence = float(neural_candidate["confidence"])
+        features = dict(neural_candidate["features"])
+        base_reason = "router_neural_prediction"
     else:
-        difficulty = "hard"
-        latency_budget_ms = 3000
-
-    row = pd.DataFrame([{
-        "query": query,
-        "contains_code": contains_code,
-        "error_log_present": error_log_present,
-        "memory_needed": memory_needed,
-        "multi_hop": multi_hop,
-        "estimated_input_tokens": estimated_tokens,
-        "latency_budget_ms": latency_budget_ms,
-        "difficulty": difficulty,
-        "retrieval_quality_label": retrieval_quality_label,
-    }])
-
-    probs = router_model.predict_proba(row)[0]
-    classes = router_model.named_steps["clf"].classes_
-    idx = int(np.argmax(probs))
-    raw_expert = str(classes[idx])
-    confidence = float(probs[idx])
+        features = build_router_features(query, retrieval_quality_label, has_images)
+        row = pd.DataFrame([{
+            "query": query,
+            "contains_code": features["contains_code"],
+            "error_log_present": features["error_log_present"],
+            "memory_needed": features["memory_needed"],
+            "multi_hop": features["multi_hop"],
+            "estimated_input_tokens": features["estimated_input_tokens"],
+            "latency_budget_ms": features["latency_budget_ms"],
+            "difficulty": features["difficulty"],
+            "retrieval_quality_label": features["retrieval_quality_label"],
+        }])
+        probs = router_model.predict_proba(row)[0]
+        classes = router_model.named_steps["clf"].classes_
+        idx = int(np.argmax(probs))
+        raw_expert = str(classes[idx])
+        confidence = float(probs[idx])
+        base_reason = "router_lr_prediction"
 
     fallback_triggered = confidence < ROUTER_CONF_THRESHOLD
     final_expert = "gpt_fallback" if fallback_triggered else raw_expert
-    route_reason = "router_prediction"
+    route_reason = base_reason
     if fallback_triggered:
-        route_reason = "router_low_confidence"
+        route_reason = f"{base_reason}_low_confidence"
 
     # Heuristic overrides let us support newly added experts before retraining the LR router.
     if heuristic_expert:
         final_expert = heuristic_expert
         fallback_triggered = final_expert == "gpt_fallback"
-        route_reason = "heuristic_override"
+        route_reason = f"{base_reason}_heuristic_override"
 
     route = EXPERT_TO_PROVIDER_ROUTE.get(final_expert, EXPERT_TO_PROVIDER_ROUTE["gpt_fallback"])
     return {
@@ -558,16 +732,7 @@ def infer_router(query: str, retrieval_quality_label: str = "medium", has_images
         "reason": route_reason,
         "provider": route["provider"],
         "model_route_alias": route["model"],
-        "features": {
-            "contains_code": contains_code,
-            "error_log_present": error_log_present,
-            "memory_needed": memory_needed,
-            "multi_hop": multi_hop,
-            "estimated_input_tokens": estimated_tokens,
-            "difficulty": difficulty,
-            "retrieval_quality_label": retrieval_quality_label,
-            "latency_budget_ms": latency_budget_ms,
-        },
+        "features": features,
     }
 
 
@@ -664,6 +829,17 @@ async def planner_agent(query: str, has_images: bool) -> Dict[str, Any]:
     }
 
 
+async def policy_agent(query: str, user_id: str) -> Dict[str, Any]:
+    # Simple policy gate placeholder for permissions/safety/rate controls.
+    if len(query.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    if len(query) > 4000:
+        raise HTTPException(status_code=400, detail="Query exceeds max length")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Missing authenticated user")
+    return {"policy_ok": True}
+
+
 async def router_agent(query: str, retrieval_quality_label: str, has_images: bool) -> Dict[str, Any]:
     return await asyncio.to_thread(
         infer_router,
@@ -730,21 +906,26 @@ async def memory_writer_agent(user_id: str, session_id: str, query: str, respons
     return {"stored": stored}
 
 
-async def file_ingestion_agent(user_id: str, session_id: str, user_prompt: str, files: List[UploadFile]) -> List[Dict[str, Any]]:
+async def ingest_raw_files_agent(
+    user_id: str,
+    session_id: str,
+    user_prompt: str,
+    raw_files: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     docs: List[Dict[str, Any]] = []
     docs_dir = user_docs_dir(user_id)
-    for upload in files:
-        raw = await upload.read()
+    for payload in raw_files:
+        raw = payload.get("data", b"")
         if not raw:
             continue
-        original_name = safe_filename(upload.filename or "upload")
+        original_name = safe_filename(str(payload.get("filename", "upload")))
         digest = hashlib.sha1(raw).hexdigest()[:10]
         doc_id = f"{session_id}-{digest}"
         saved_path = docs_dir / f"{doc_id}-{original_name}"
         saved_path.write_bytes(raw)
 
         lower_name = original_name.lower()
-        mime = upload.content_type or ""
+        mime = str(payload.get("content_type") or "")
         extracted_text = ""
         source_type = "text"
         if lower_name.endswith(".pdf") or "pdf" in mime:
@@ -764,6 +945,20 @@ async def file_ingestion_agent(user_id: str, session_id: str, user_prompt: str, 
                 "text": extracted_text.strip(),
             })
     return docs
+
+
+async def file_ingestion_agent(user_id: str, session_id: str, user_prompt: str, files: List[UploadFile]) -> List[Dict[str, Any]]:
+    raw_files: List[Dict[str, Any]] = []
+    for upload in files:
+        raw = await upload.read()
+        raw_files.append(
+            {
+                "filename": upload.filename or "upload",
+                "content_type": upload.content_type or "",
+                "data": raw,
+            }
+        )
+    return await ingest_raw_files_agent(user_id, session_id, user_prompt, raw_files)
 
 
 async def chunking_agent(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -834,6 +1029,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[str] = None
     image_urls: Optional[List[str]] = None
+    request_id: Optional[str] = None
 
 
 class AgentTraceItem(BaseModel):
@@ -848,6 +1044,7 @@ class ChatResponse(BaseModel):
     user_id: str
     response: str
     session_id: str
+    request_id: Optional[str] = None
     router_label: Optional[str] = None
     router_confidence: Optional[float] = None
     route_provider: Optional[str] = None
@@ -930,6 +1127,18 @@ class SessionRestoreRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
 
 
+class IngestionJobResponse(BaseModel):
+    job_id: str
+    status: str
+    queued_at: str
+
+
+class ProgressStateResponse(BaseModel):
+    request_id: str
+    done: bool
+    events: List[Dict[str, Any]]
+
+
 def load_session_envelope(user_id: str, session_id: str) -> SessionEnvelope:
     path = session_file_path(user_id, session_id)
     ts = now_iso()
@@ -987,92 +1196,244 @@ async def execute_chat_pipeline(
     session_env: SessionEnvelope,
     image_urls: Optional[List[str]] = None,
     rag_chunks: Optional[List[Dict[str, Any]]] = None,
+    request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    agent_trace: List[Dict[str, Any]] = []
+    class AgentGraphState(TypedDict, total=False):
+        user_id: str
+        session_id: str
+        query: str
+        image_urls: List[str]
+        rag_chunks: List[Dict[str, Any]]
+        session_env: SessionEnvelope
+        plan: Dict[str, Any]
+        policy: Dict[str, Any]
+        router_decision: Dict[str, Any]
+        memory_result: Dict[str, Any]
+        guarded_memory: Dict[str, Any]
+        messages: List[Dict[str, Any]]
+        generation: Dict[str, Any]
+        assistant_response: str
+        writer_result: Dict[str, Any]
+        source_docs_used: List[str]
+        retrieved_chunks_count: int
+        agent_trace: List[Dict[str, Any]]
 
-    planner_idx = start_agent_event(agent_trace, "PlannerAgent")
-    plan = await planner_agent(query, has_images=bool(image_urls))
-    end_agent_event(agent_trace, planner_idx, detail=f"expert_hint={plan.get('expert_hint')}")
+    async def run_with_retry(agent_name: str, trace: List[Dict[str, Any]], fn: Callable[[], Awaitable[Any]], detail: Optional[str] = None) -> Any:
+        idx = start_agent_event(trace, agent_name, detail=detail)
+        if request_id:
+            progress_emit(request_id, agent_name, "running", detail)
+        attempts = 2
+        last_exc: Optional[Exception] = None
+        started = time.time()
+        AGENT_METRICS.setdefault(agent_name, {"calls": 0.0, "failures": 0.0, "total_latency_ms": 0.0})
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await fn()
+                end_agent_event(trace, idx, detail=f"attempt={attempt} success")
+                elapsed_ms = int((time.time() - started) * 1000)
+                AGENT_METRICS[agent_name]["calls"] += 1
+                AGENT_METRICS[agent_name]["total_latency_ms"] += elapsed_ms
+                if request_id:
+                    progress_emit(request_id, agent_name, "completed", f"attempt={attempt} success")
+                return result
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    await asyncio.sleep(0.2 * attempt)
+                    continue
+                end_agent_event(trace, idx, status="failed", detail=f"attempts={attempts};error={exc}")
+                AGENT_METRICS[agent_name]["calls"] += 1
+                AGENT_METRICS[agent_name]["failures"] += 1
+                AGENT_METRICS[agent_name]["total_latency_ms"] += int((time.time() - started) * 1000)
+                if request_id:
+                    progress_emit(request_id, agent_name, "failed", str(exc))
+                raise
+        raise RuntimeError(str(last_exc) if last_exc else f"{agent_name} failed")
 
-    router_idx = start_agent_event(agent_trace, "RouterAgent")
-    memory_idx = start_agent_event(agent_trace, "MemoryRetrieverAgent")
-    router_task = asyncio.create_task(
-        router_agent(
-            query,
-            retrieval_quality_label="medium",
-            has_images=bool(image_urls),
+    async def planner_node(state: AgentGraphState) -> AgentGraphState:
+        trace = state["agent_trace"]
+        plan = await run_with_retry(
+            "PlannerAgent",
+            trace,
+            lambda: planner_agent(state["query"], has_images=bool(state.get("image_urls"))),
         )
-    )
-    memory_task = asyncio.create_task(memory_retriever_agent(user_id, session_env, query))
-    router_decision, memory_result = await asyncio.gather(router_task, memory_task)
-    end_agent_event(
-        agent_trace,
-        router_idx,
-        detail=f"{router_decision.get('expert_label')} ({router_decision.get('confidence', 0):.2f})",
-    )
-    end_agent_event(
-        agent_trace,
-        memory_idx,
-        detail=f"session_tail={len(memory_result.get('session_tail', []))}, long_hits={len(memory_result.get('long_memory_hits', []))}",
-    )
+        return {"plan": plan}
 
-    guardrail_idx = start_agent_event(agent_trace, "GuardrailAgent")
-    guarded_memory = await guardrail_agent(memory_result)
-    end_agent_event(agent_trace, guardrail_idx, detail="sanitized memory context")
+    async def policy_node(state: AgentGraphState) -> AgentGraphState:
+        trace = state["agent_trace"]
+        policy = await run_with_retry(
+            "PolicyAgent",
+            trace,
+            lambda: policy_agent(state["query"], state["user_id"]),
+        )
+        return {"policy": policy}
 
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": PERSONALITY}]
-    long_hits = guarded_memory.get("long_memory_hits", [])
-    if long_hits:
-        memory_lines = [f"- {hit.get('fact_text', '')}" for hit in long_hits[:MEMORY_RETRIEVAL_TOP_K]]
-        messages.append({
-            "role": "system",
-            "content": "Relevant long-term user memory:\n" + "\n".join(memory_lines),
-        })
-    if rag_chunks:
-        rag_lines = [f"- ({chunk.get('file_name','doc')}) {chunk.get('text','')}" for chunk in rag_chunks[:RAG_TOP_K]]
-        messages.append({
-            "role": "system",
-            "content": "Relevant uploaded document context:\n" + "\n".join(rag_lines),
-        })
+    async def route_retrieve_node(state: AgentGraphState) -> AgentGraphState:
+        trace = state["agent_trace"]
 
-    messages.extend(guarded_memory.get("session_tail", []))
-    if image_urls:
-        user_content: List[Dict[str, Any]] = [{"type": "text", "text": query}]
-        for url in image_urls[:3]:
-            user_content.append({"type": "image_url", "image_url": {"url": url}})
-        messages.append({"role": "user", "content": user_content})
-    else:
-        messages.append({"role": "user", "content": query})
+        async def _run():
+            router_task = asyncio.create_task(
+                router_agent(
+                    state["query"],
+                    retrieval_quality_label="medium",
+                    has_images=bool(state.get("image_urls")),
+                )
+            )
+            mem_task = asyncio.create_task(
+                memory_retriever_agent(state["user_id"], state["session_env"], state["query"])
+            )
+            router_decision, memory_result = await asyncio.gather(router_task, mem_task)
+            return router_decision, memory_result
 
-    llm_idx = start_agent_event(agent_trace, "LLMExpertAgent", detail=router_decision.get("expert_label"))
-    gen = await asyncio.to_thread(generate_with_route, messages, router_decision)
-    end_agent_event(
-        agent_trace,
-        llm_idx,
-        detail=f"{gen.get('provider_used')}::{gen.get('model_used')} latency={gen.get('latency_ms')}ms",
-    )
-    assistant_response = gen["text"]
+        router_decision, memory_result = await run_with_retry("RouterAndMemoryAgent", trace, _run)
+        return {"router_decision": router_decision, "memory_result": memory_result}
 
-    writer_idx = start_agent_event(agent_trace, "MemoryWriterAgent")
-    writer_result = await memory_writer_agent(user_id, session_id, query, assistant_response)
-    end_agent_event(agent_trace, writer_idx, detail=f"stored={writer_result.get('stored', 0)}")
+    async def guardrail_node(state: AgentGraphState) -> AgentGraphState:
+        trace = state["agent_trace"]
+        guarded = await run_with_retry(
+            "GuardrailAgent",
+            trace,
+            lambda: guardrail_agent(state["memory_result"]),
+        )
+        return {"guarded_memory": guarded}
 
-    if image_urls:
-        session_env.messages.append({"role": "user", "content": messages[-1]["content"]})
-    else:
-        session_env.messages.append({"role": "user", "content": query})
-    session_env.messages.append({"role": "assistant", "content": assistant_response})
-    save_session_envelope(session_env)
+    async def llm_node(state: AgentGraphState) -> AgentGraphState:
+        trace = state["agent_trace"]
 
-    source_docs_used = sorted(list({str(c.get("doc_id")) for c in (rag_chunks or []) if c.get("doc_id")}))
-    return {
-        "assistant_response": assistant_response,
-        "router_decision": router_decision,
-        "generation": gen,
-        "agent_trace": agent_trace,
-        "retrieved_chunks_count": len(rag_chunks or []),
-        "source_docs_used": source_docs_used,
+        async def _run():
+            messages: List[Dict[str, Any]] = [{"role": "system", "content": PERSONALITY}]
+            long_hits = state["guarded_memory"].get("long_memory_hits", [])
+            if long_hits:
+                memory_lines = [f"- {hit.get('fact_text', '')}" for hit in long_hits[:MEMORY_RETRIEVAL_TOP_K]]
+                messages.append({
+                    "role": "system",
+                    "content": "Relevant long-term user memory:\n" + "\n".join(memory_lines),
+                })
+            rag_chunks_local = state.get("rag_chunks", [])
+            if rag_chunks_local:
+                rag_lines = [f"- ({chunk.get('file_name','doc')}) {chunk.get('text','')}" for chunk in rag_chunks_local[:RAG_TOP_K]]
+                messages.append({
+                    "role": "system",
+                    "content": "Relevant uploaded document context:\n" + "\n".join(rag_lines),
+                })
+
+            messages.extend(state["guarded_memory"].get("session_tail", []))
+            if state.get("image_urls"):
+                user_content: List[Dict[str, Any]] = [{"type": "text", "text": state["query"]}]
+                for url in state["image_urls"][:3]:
+                    user_content.append({"type": "image_url", "image_url": {"url": url}})
+                messages.append({"role": "user", "content": user_content})
+            else:
+                messages.append({"role": "user", "content": state["query"]})
+
+            gen = await asyncio.to_thread(generate_with_route, messages, state["router_decision"])
+            return messages, gen
+
+        messages, generation = await run_with_retry(
+            "LLMExpertAgent",
+            trace,
+            _run,
+            detail=str(state["router_decision"].get("expert_label")),
+        )
+        assistant_response = generation["text"]
+        return {"messages": messages, "generation": generation, "assistant_response": assistant_response}
+
+    async def memory_writer_node(state: AgentGraphState) -> AgentGraphState:
+        trace = state["agent_trace"]
+        writer_result = await run_with_retry(
+            "MemoryWriterAgent",
+            trace,
+            lambda: memory_writer_agent(state["user_id"], state["session_id"], state["query"], state["assistant_response"]),
+        )
+        return {"writer_result": writer_result}
+
+    async def finalize_node(state: AgentGraphState) -> AgentGraphState:
+        if state.get("image_urls"):
+            state["session_env"].messages.append({"role": "user", "content": state["messages"][-1]["content"]})
+        else:
+            state["session_env"].messages.append({"role": "user", "content": state["query"]})
+        state["session_env"].messages.append({"role": "assistant", "content": state["assistant_response"]})
+        save_session_envelope(state["session_env"])
+
+        source_docs_used = sorted(list({str(c.get("doc_id")) for c in state.get("rag_chunks", []) if c.get("doc_id")}))
+        return {
+            "source_docs_used": source_docs_used,
+            "retrieved_chunks_count": len(state.get("rag_chunks", [])),
+        }
+
+    graph = StateGraph(AgentGraphState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("policy", policy_node)
+    graph.add_node("route_retrieve", route_retrieve_node)
+    graph.add_node("guardrail", guardrail_node)
+    graph.add_node("llm", llm_node)
+    graph.add_node("memory_writer", memory_writer_node)
+    graph.add_node("finalize", finalize_node)
+
+    graph.set_entry_point("planner")
+    graph.add_edge("planner", "policy")
+    graph.add_edge("policy", "route_retrieve")
+    graph.add_edge("route_retrieve", "guardrail")
+    graph.add_edge("guardrail", "llm")
+    graph.add_edge("llm", "memory_writer")
+    graph.add_edge("memory_writer", "finalize")
+    graph.add_edge("finalize", END)
+
+    runnable = graph.compile()
+    initial_state: AgentGraphState = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "query": query,
+        "image_urls": image_urls or [],
+        "rag_chunks": rag_chunks or [],
+        "session_env": session_env,
+        "agent_trace": [],
     }
+    final_state = await runnable.ainvoke(initial_state)
+
+    return {
+        "assistant_response": final_state["assistant_response"],
+        "router_decision": final_state["router_decision"],
+        "generation": final_state["generation"],
+        "agent_trace": final_state["agent_trace"],
+        "retrieved_chunks_count": final_state.get("retrieved_chunks_count", len(rag_chunks or [])),
+        "source_docs_used": final_state.get("source_docs_used", []),
+    }
+
+
+async def ingestion_worker() -> None:
+    while True:
+        job = await INGESTION_QUEUE.get()
+        job_id = str(job["job_id"])
+        try:
+            INGESTION_JOBS[job_id]["status"] = "processing"
+            docs = await ingest_raw_files_agent(
+                user_id=str(job["user_id"]),
+                session_id=str(job["session_id"]),
+                user_prompt=str(job.get("message", "")),
+                raw_files=list(job.get("files", [])),
+            )
+            chunks = await chunking_agent(docs)
+            emb = await embedding_agent(str(job["user_id"]), str(job["session_id"]), chunks)
+            INGESTION_JOBS[job_id]["status"] = "completed"
+            INGESTION_JOBS[job_id]["result"] = {
+                "parsed_docs": len(docs),
+                "chunks": len(chunks),
+                "stored_chunks": emb.get("stored_chunks", 0),
+            }
+            INGESTION_JOBS[job_id]["updated_at"] = now_iso()
+        except Exception as exc:
+            INGESTION_JOBS[job_id]["status"] = "failed"
+            INGESTION_JOBS[job_id]["error"] = str(exc)
+            INGESTION_JOBS[job_id]["updated_at"] = now_iso()
+        finally:
+            INGESTION_QUEUE.task_done()
+
+
+@app.on_event("startup")
+async def _startup_background_workers():
+    if INGESTION_QUEUE_ENABLED:
+        asyncio.create_task(ingestion_worker())
 
 
 
@@ -1193,9 +1554,10 @@ async def me(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
-        request_id = str(uuid.uuid4())
+        request_id = request.request_id or str(uuid.uuid4())
         user_id = current_user["user_id"]
         session_id = request.session_id or str(uuid.uuid4())
+        progress_init(request_id, user_id)
 
         session_env = load_session_envelope(user_id, session_id)
         if session_env.is_deleted:
@@ -1208,6 +1570,7 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             session_env=session_env,
             image_urls=request.image_urls,
             rag_chunks=None,
+            request_id=request_id,
         )
         router_decision = result["router_decision"]
         gen = result["generation"]
@@ -1235,11 +1598,13 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             "source_docs_used": result["source_docs_used"],
             "agent_trace": agent_trace,
         })
+        progress_done(request_id)
 
         return ChatResponse(
             user_id=user_id,
             response=assistant_response,
             session_id=session_id,
+            request_id=request_id,
             router_label=router_decision["expert_label"],
             router_confidence=router_decision["confidence"],
             route_provider=gen["provider_used"],
@@ -1273,6 +1638,8 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
             "error": str(e),
             "agent_trace": [],
         })
+        if request.request_id:
+            progress_done(request.request_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1280,14 +1647,16 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
 async def chat_with_files(
     message: str = Form(...),
     session_id: Optional[str] = Form(None),
+    request_id: Optional[str] = Form(None),
     files: List[UploadFile] = File(default=[]),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     ingestion_trace: List[Dict[str, Any]] = []
     try:
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         user_id = current_user["user_id"]
         final_session_id = session_id or str(uuid.uuid4())
+        progress_init(request_id, user_id)
         session_env = load_session_envelope(user_id, final_session_id)
         if session_env.is_deleted:
             raise HTTPException(status_code=404, detail="Session is deleted. Restore it or start a new session.")
@@ -1321,6 +1690,7 @@ async def chat_with_files(
             query=message,
             session_env=session_env,
             rag_chunks=rag_chunks,
+            request_id=request_id,
         )
         router_decision = result["router_decision"]
         gen = result["generation"]
@@ -1349,11 +1719,13 @@ async def chat_with_files(
             "uploaded_docs_count": len(docs),
             "agent_trace": agent_trace,
         })
+        progress_done(request_id)
 
         return ChatResponse(
             user_id=user_id,
             response=assistant_response,
             session_id=final_session_id,
+            request_id=request_id,
             router_label=router_decision["expert_label"],
             router_confidence=router_decision["confidence"],
             route_provider=gen["provider_used"],
@@ -1387,6 +1759,8 @@ async def chat_with_files(
             "error": str(e),
             "agent_trace": ingestion_trace,
         })
+        if request_id:
+            progress_done(request_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1395,6 +1769,7 @@ async def list_experts():
     return {
         "experts": EXPERT_TO_PROVIDER_ROUTE,
         "config_env_keys": [
+            "ROUTER_BACKEND",
             "ML_EXPERT_MODEL",
             "MATH_EXPERT_MODEL",
             "DL_EXPERT_MODEL",
@@ -1404,11 +1779,94 @@ async def list_experts():
             "RAG_EXPERT_MODEL",
             "LLM_EVAL_EXPERT_MODEL",
             "FRIENDLY_EXPERT_MODEL",
+            "ROUTER_NEURAL_PATH",
+            "ROUTER_NEURAL_META_PATH",
+            "ROUTER_MODEL_PATH",
+            "ROUTER_META_PATH",
             "MULTIMODAL_OPENAI_MODEL",
             "OPENAI_FALLBACK_MODEL",
             "EMBEDDING_MODEL",
         ],
     }
+
+
+@app.get("/chat/progress/{request_id}", response_model=ProgressStateResponse)
+async def get_chat_progress(request_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    state = PROGRESS_STATE.get(request_id)
+    if not state or state.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Progress request not found")
+    return ProgressStateResponse(
+        request_id=request_id,
+        done=bool(state.get("done", False)),
+        events=list(state.get("events", [])),
+    )
+
+
+@app.post("/documents/ingest", response_model=IngestionJobResponse)
+async def queue_document_ingestion(
+    message: str = Form(""),
+    session_id: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    if not INGESTION_QUEUE_ENABLED:
+        raise HTTPException(status_code=400, detail="Ingestion queue is disabled")
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+
+    user_id = current_user["user_id"]
+    final_session_id = session_id or str(uuid.uuid4())
+    payload_files: List[Dict[str, Any]] = []
+    for upload in files:
+        payload_files.append(
+            {
+                "filename": upload.filename or "upload",
+                "content_type": upload.content_type or "",
+                "data": await upload.read(),
+            }
+        )
+
+    job_id = str(uuid.uuid4())
+    INGESTION_JOBS[job_id] = {
+        "job_id": job_id,
+        "user_id": user_id,
+        "session_id": final_session_id,
+        "status": "queued",
+        "queued_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await INGESTION_QUEUE.put(
+        {
+            "job_id": job_id,
+            "user_id": user_id,
+            "session_id": final_session_id,
+            "message": message,
+            "files": payload_files,
+        }
+    )
+    return IngestionJobResponse(job_id=job_id, status="queued", queued_at=INGESTION_JOBS[job_id]["queued_at"])
+
+
+@app.get("/documents/ingest/{job_id}")
+async def get_document_ingest_status(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    job = INGESTION_JOBS.get(job_id)
+    if not job or job.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Ingestion job not found")
+    return job
+
+
+@app.get("/agent-metrics")
+async def get_agent_metrics(current_user: Dict[str, Any] = Depends(get_current_user)):
+    out = {}
+    for agent, data in AGENT_METRICS.items():
+        calls = max(1.0, data.get("calls", 0.0))
+        out[agent] = {
+            "calls": int(data.get("calls", 0.0)),
+            "failures": int(data.get("failures", 0.0)),
+            "failure_rate": float(data.get("failures", 0.0) / calls),
+            "avg_latency_ms": float(data.get("total_latency_ms", 0.0) / calls),
+        }
+    return {"agents": out}
 
 
 @app.get("/sessions")

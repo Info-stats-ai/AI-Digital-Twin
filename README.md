@@ -39,19 +39,18 @@ This project addresses those issues by combining:
 - memory, sessions, and document vectors are scoped by user
 
 ### 2) Async Agent Pipeline
-For `/chat` and `/chat/rag`, backend runs a pipeline like:
-- `PlannerAgent`
-- `RouterAgent`
-- `MemoryRetrieverAgent`
-- `GuardrailAgent`
-- `LLMExpertAgent`
-- `MemoryWriterAgent`
-
-`RouterAgent` and `MemoryRetrieverAgent` run concurrently using `asyncio.gather(...)` to reduce end-to-end latency.
+For `/chat` and `/chat/rag`, backend runs a LangGraph pipeline with six stages:
+1. `PlannerAgent`
+2. `PolicyAgent`
+3. `RouterAndMemoryAgent` (route + retrieval in parallel)
+4. `GuardrailAgent`
+5. `LLMExpertAgent`
+6. `MemoryWriterAgent` and `FinalizeAgent`
 
 ### 3) Expert Routing (MoE-style)
 Queries are routed by:
-- LR router prediction + confidence threshold
+- neural router prediction (`router_neural_moe.pt`) + confidence threshold
+- LR router fallback (`router_tfidf_lr.pkl`) when neural router is unavailable
 - heuristic override for expert-specific intents
 
 Expert routes are configured in `EXPERT_TO_PROVIDER_ROUTE` and exposed via `GET /experts`.
@@ -194,11 +193,59 @@ Mitigation:
 
 ## Known Current Limitations
 
-- hybrid router (LR + heuristics), not a full neural gate yet
+- weak-supervision labels were used for neural dataset bootstrapping and can include noise
 - vector store is JSONL/file-based, not a production DB
 - basic sanitization only; needs stronger DLP/PII controls
 - no streaming token output yet
 - ingestion currently in request path (can increase latency)
+
+## Agentic Workflow Status
+
+Current system now uses **LangGraph-based async orchestration** in FastAPI.
+
+### Six implemented workflow stages (LangGraph nodes)
+1. `PlannerAgent` - plan and expert hint
+2. `RouterAndMemoryAgent` - route + retrieve user memory concurrently
+3. `GuardrailAgent` - sanitize/restrict memory context
+4. `LLMExpertAgent` - call selected expert model and generate response
+5. `MemoryWriterAgent` - persist long-memory facts when relevant
+6. `FinalizeAgent` - commit session updates and outputs
+
+### Did we use LangChain / LangGraph / CrewAI?
+- **LangGraph: Yes**
+- **LangChain: No**
+- **CrewAI: No**
+
+### Runtime routing mode
+- `ROUTER_BACKEND=neural` (default) uses `artifacts/router_neural_moe.pt`
+- falls back to LR router (`artifacts/router_tfidf_lr.pkl`) if neural is unavailable
+
+### How to evolve to a stronger multi-agent async workflow
+1. Add explicit agent contracts (typed input/output schemas per agent)
+2. Add durable task queue for heavy agents (ingestion, embedding, eval)
+3. Add event-stream progress channel (SSE/WebSocket) for true realtime agent state
+4. Add policy agent for security/rate-limit/tool permissions
+5. Add planner memory + retry/circuit-breakers per agent
+6. Add agent-level SLA metrics (p50/p95/error by agent)
+
+## Neural Router Dataset (What and Why)
+
+Neural MoE training script:
+- `scripts/train_neural_moe_from_urls.py`
+
+Imported public data sources:
+- Stanford Alpaca (`alpaca_data.json`) -> broad instruction/task diversity
+- GSM8K train (`train.jsonl`) -> strong math reasoning signal
+
+Why these were used:
+- fast bootstrap of multi-expert route supervision
+- better class diversity than only project-local chat logs
+- improves early routing generalization before more real telemetry is available
+
+Generated outputs:
+- `data/neural_moe_imported_dataset.jsonl`
+- `artifacts/router_neural_moe.pt`
+- `reports/neural_moe/metrics.json`
 
 ## Recommended Production Upgrades (Next Steps)
 
@@ -208,6 +255,15 @@ Mitigation:
 4. Structured error codes + retry policies
 5. Strong observability dashboards (route, cost, p50/p95, fallback rate)
 6. Harden security (secrets manager, encryption at rest, audit trails)
+
+## Six Workflow Hardening Stages (Implemented)
+
+1. **Typed contracts:** LangGraph state schema with typed state fields
+2. **Background heavy tasks:** asynchronous document ingestion queue endpoints
+3. **Live progress tracking:** request-level progress API consumed by frontend while chat runs
+4. **Policy gate:** dedicated `PolicyAgent` stage before routing
+5. **Retries + resilience:** per-agent retry wrapper and failure trace updates
+6. **Agent-level metrics:** `/agent-metrics` endpoint exposing calls, failure rate, avg latency
 
 ## Local Run
 
@@ -250,6 +306,10 @@ Open:
 - `GET /auth/me`
 - `POST /chat` (text chat)
 - `POST /chat/rag` (prompt + PDF/image files)
+- `GET /chat/progress/{request_id}` (live stage status for running request)
+- `POST /documents/ingest` (queue async file ingestion)
+- `GET /documents/ingest/{job_id}` (check ingestion job status)
+- `GET /agent-metrics` (per-agent call/failure/latency stats)
 - `GET /experts` (expert -> provider/model mapping)
 - `GET /sessions`
 - `GET /memory/export`
@@ -348,17 +408,14 @@ This tracks how much valuable system output you can produce per hour of human ef
 ### Why it matters
 A high MoJo score indicates strong leverage: fewer human hours to build and ship meaningful capability.
 
-### Example (Wingman-style leverage)
-Given:
-- Your effort: `300` hours
-- Traditional baseline: team for `6` months
+### Personal MoJo (single engineer baseline)
+Using your stated effort:
+- Your hours: `300`
+- Baseline assumption (single engineer, 6 months): `1 * 6 * 160 = 960`
 
-If baseline is:
-- `6 engineers * 6 months * 160 hours/month = 5760 hours`
-- MoJo uplift vs baseline = `5760 / 300 = 19.2x`
+Personal leverage:
+- `MoJo uplift = 960 / 300 = 3.2x`
 
-If baseline is:
-- `4 engineers * 6 months * 160 hours/month = 3840 hours`
-- MoJo uplift = `3840 / 300 = 12.8x`
-
-Interpretation: the delivered output shows roughly `~13x to ~19x` human-time leverage depending on baseline.
+Optional context ranges:
+- vs 4-engineer baseline: `12.8x`
+- vs 6-engineer baseline: `19.2x`
