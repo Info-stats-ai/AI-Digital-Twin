@@ -253,3 +253,112 @@ Open:
 - `GET /experts` (expert -> provider/model mapping)
 - `GET /sessions`
 - `GET /memory/export`
+
+## Evaluation, Training, and Routing Assets
+
+### Router Evaluation / Analysis Scripts
+- `scripts/phase2_3_eval_router.py`  
+  Offline router evaluation + threshold sweep (accuracy, macro-F1, fallback rate, cost proxy).
+
+- `scripts/phase2_3_analyze_telemetry.py`  
+  Analyze live route telemetry and generate summary + misroute candidates.
+
+- `scripts/phase2_3_enrich_from_telemetry.py`  
+  Convert hard/low-confidence telemetry samples into enrichment candidates for retraining.
+
+### Neural MoE Router Training Script
+- `scripts/train_neural_moe_from_urls.py`  
+  Import public data via URL, auto-label expert routes using rules, train a neural MoE-style router, and export artifacts/reports.
+
+### Generated Data and Artifacts
+- Dataset: `data/neural_moe_imported_dataset.jsonl`
+- Neural model: `artifacts/router_neural_moe.pt`
+- Neural metadata: `artifacts/router_neural_moe_meta.json`
+- Metrics: `reports/neural_moe/metrics.json`
+- Reports: `reports/neural_moe/val_report.json`, `reports/neural_moe/test_report.json`
+- Live route telemetry: `memory/route_telemetry.jsonl`
+
+## STAR Method (Project Narrative)
+
+### Situation
+Single-model assistants are usually expensive, harder to debug, and brittle under diverse query types. The goal was to build a production-grade AI Digital Twin that is observable, memory-aware, and cost/latency efficient.
+
+### Task
+Deliver an AI assistant that:
+1. Routes to specialist experts instead of one universal model
+2. Maintains user-isolated memory with compliance controls
+3. Supports file-assisted chat (PDF/image + prompt)
+4. Produces measurable routing/evaluation outputs for iteration
+
+### Action
+Implemented:
+- MoE-style routing with confidence threshold and fallback
+- Async multi-agent orchestration for lower latency (`Planner`, `Router`, `Retriever`, `Guardrail`, `LLM`, `MemoryWriter`)
+- User-scoped long memory and telemetry logs
+- File RAG ingestion (`/chat/rag`): parse -> chunk -> embed -> retrieve -> inject
+- URL-driven neural MoE training pipeline with exported metrics/artifacts
+
+### Result
+- Working multi-expert Digital Twin with per-user memory guardrails
+- Neural MoE-style router trained across 13 expert classes
+- Evaluation outputs (current run):
+  - Validation accuracy: `0.9099`
+  - Validation macro-F1: `0.9065`
+  - Test accuracy: `0.8900`
+  - Test macro-F1: `0.8841`
+- Strong foundation for production hardening and continuous retraining
+
+## Key Definitions
+
+- **MoE (Mixture of Experts):** A routing architecture where a gate/router selects the best expert model per query.
+- **Router confidence threshold:** Minimum confidence required to trust route prediction; otherwise fallback.
+- **RAG:** Retrieve relevant chunks from indexed content and provide them as grounding context to generation.
+- **Guardrails:** Safety/privacy controls, including user-bound data access and sanitization.
+- **Telemetry:** Structured logs for route label, confidence, fallback, latency, and agent execution trace.
+
+## Production Challenges and Mitigations
+
+### 1) Latency spikes
+- **Why it happens:** PDF/image parsing, embedding calls, large model invocations, large contexts.
+- **Mitigations:** background ingestion workers, chunk/page limits, caching, async orchestration.
+
+### 2) Cost growth
+- **Why it happens:** high fallback usage, repeated embeddings, oversized contexts.
+- **Mitigations:** threshold tuning, cost-aware route policies, embedding reuse, tighter retrieval budgets.
+
+### 3) Routing drift
+- **Why it happens:** user query distribution changes over time.
+- **Mitigations:** telemetry review, misroute labeling, periodic retraining and A/B comparisons.
+
+### 4) Privacy/compliance risks
+- **Why it happens:** uploaded docs and long memory may contain sensitive data.
+- **Mitigations:** strict `user_id` retrieval filters, redaction/sanitization, export/delete flows, audit logs.
+
+### 5) Reliability under load
+- **Why it happens:** local model runtime constraints and provider outages.
+- **Mitigations:** retries with backoff, circuit-breaking, health checks, queue-based ingestion.
+
+## MoJo Score (Leverage Metric)
+
+### Definition
+`MoJo Score = Output / Human Hours`
+
+This tracks how much valuable system output you can produce per hour of human effort.
+
+### Why it matters
+A high MoJo score indicates strong leverage: fewer human hours to build and ship meaningful capability.
+
+### Example (Wingman-style leverage)
+Given:
+- Your effort: `300` hours
+- Traditional baseline: team for `6` months
+
+If baseline is:
+- `6 engineers * 6 months * 160 hours/month = 5760 hours`
+- MoJo uplift vs baseline = `5760 / 300 = 19.2x`
+
+If baseline is:
+- `4 engineers * 6 months * 160 hours/month = 3840 hours`
+- MoJo uplift = `3840 / 300 = 12.8x`
+
+Interpretation: the delivered output shows roughly `~13x to ~19x` human-time leverage depending on baseline.

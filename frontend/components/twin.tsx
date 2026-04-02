@@ -11,7 +11,7 @@ interface Message {
     agentTrace?: AgentTraceItem[];
 }
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+const API_BASE_URL_ENV = process.env.NEXT_PUBLIC_API_BASE_URL || '';
 const TOKEN_KEY = 'dt_access_token';
 const SESSION_KEY = 'dt_session_id';
 const USER_PROFILE_KEY = 'dt_user_profile';
@@ -54,6 +54,15 @@ interface ChatApiResponse {
     agent_trace?: AgentTraceItem[];
     source_docs_used?: string[];
     retrieved_chunks_count?: number;
+}
+
+function getApiBaseUrl(): string {
+    if (API_BASE_URL_ENV) return API_BASE_URL_ENV;
+    if (typeof window !== 'undefined') {
+        const host = window.location.hostname;
+        return `http://${host}:8000`;
+    }
+    return 'http://localhost:8000';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -146,6 +155,7 @@ export default function Twin() {
         }
         try {
             const endpoint = authMode === 'register' ? '/auth/register' : '/auth/login';
+            const apiBaseUrl = getApiBaseUrl();
             const payload = authMode === 'register'
                 ? {
                     first_name: firstName,
@@ -159,7 +169,7 @@ export default function Twin() {
                     password,
                 };
 
-            const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+            const response = await fetch(`${apiBaseUrl}${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
@@ -241,13 +251,14 @@ export default function Twin() {
         }, 700);
 
         try {
+            const apiBaseUrl = getApiBaseUrl();
             let response: Response;
             if (selectedFiles.length > 0) {
                 const formData = new FormData();
                 formData.append('message', input);
                 if (sessionId) formData.append('session_id', sessionId);
                 selectedFiles.forEach((file) => formData.append('files', file));
-                response = await fetch(`${API_BASE_URL}/chat/rag`, {
+                response = await fetch(`${apiBaseUrl}/chat/rag`, {
                     method: 'POST',
                     headers: {
                         Authorization: `Bearer ${token}`,
@@ -255,7 +266,7 @@ export default function Twin() {
                     body: formData,
                 });
             } else {
-                response = await fetch(`${API_BASE_URL}/chat`, {
+                response = await fetch(`${apiBaseUrl}/chat`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
