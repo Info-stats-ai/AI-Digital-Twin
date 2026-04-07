@@ -15,3 +15,4 @@ pymupdf
 torch
 sentence-transformers
 langgraph
+boto3    

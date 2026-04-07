@@ -19,6 +19,7 @@ import joblib
 import pandas as pd
 import numpy as np
 import requests
+import boto3
 import time
 import asyncio
 import base64
@@ -28,6 +29,7 @@ import torch
 import torch.nn as nn
 from sentence_transformers import SentenceTransformer
 from langgraph.graph import StateGraph, END
+
 
 try:
     import fitz  # PyMuPDF
@@ -79,8 +81,12 @@ ROUTER_NEURAL_META_PATH = os.getenv("ROUTER_NEURAL_META_PATH", "../artifacts/rou
 ROUTER_CONF_THRESHOLD = float(os.getenv("ROUTER_CONF_THRESHOLD", "0.62"))
 DEFAULT_OPENAI_MODEL = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", DEFAULT_OPENAI_MODEL)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "30"))
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+BEDROCK_TIMEOUT_SEC = int(os.getenv("BEDROCK_TIMEOUT_SEC", "60"))
+bedrock_runtime = boto3.client(
+    service_name="bedrock-runtime",
+    region_name=AWS_REGION,
+)
 MULTIMODAL_OPENAI_MODEL = os.getenv("MULTIMODAL_OPENAI_MODEL", "gpt-4.1-mini")
 MEMORY_RETRIEVAL_TOP_K = int(os.getenv("MEMORY_RETRIEVAL_TOP_K", "3"))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -112,19 +118,19 @@ def load_personality():
 PERSONALITY = load_personality()
 
 EXPERT_TO_PROVIDER_ROUTE = {
-    "memory_factual_expert": {"provider": "ollama", "model": "phi3:mini"},
-    "technical_expert": {"provider": "ollama", "model": "qwen2.5-coder:7b-instruct"},
-    "ml_expert": {"provider": "ollama", "model": os.getenv("ML_EXPERT_MODEL", "llama3.1:8b")},
-    "math_reasoning_expert": {"provider": "ollama", "model": os.getenv("MATH_EXPERT_MODEL", "deepseek-r1:8b")},
-    "dl_expert": {"provider": "ollama", "model": os.getenv("DL_EXPERT_MODEL", "qwen2.5-coder:7b-instruct")},
-    "genai_expert": {"provider": "ollama", "model": os.getenv("GENAI_EXPERT_MODEL", "qwen2.5:7b")},
-    "research_expert": {"provider": "ollama", "model": os.getenv("RESEARCH_EXPERT_MODEL", "mistral:7b")},
-    "agentic_ai_expert": {"provider": "ollama", "model": os.getenv("AGENTIC_EXPERT_MODEL", "llama3.1:8b")},
-    "rag_expert": {"provider": "ollama", "model": os.getenv("RAG_EXPERT_MODEL", "qwen2.5:7b")},
-    "llm_eval_expert": {"provider": "ollama", "model": os.getenv("LLM_EVAL_EXPERT_MODEL", "llama3.1:8b")},
-    "friendly_conversation_expert": {"provider": "ollama", "model": os.getenv("FRIENDLY_EXPERT_MODEL", "phi3:mini")},
-    "multimodal_expert": {"provider": "openai", "model": MULTIMODAL_OPENAI_MODEL},
-    "gpt_fallback": {"provider": "openai", "model": OPENAI_FALLBACK_MODEL},
+    "memory_factual_expert":        {"provider": "bedrock", "model": os.getenv("MEMORY_EXPERT_MODEL",   "amazon.nova-micro-v1:0")},
+    "technical_expert":             {"provider": "bedrock", "model": os.getenv("TECHNICAL_EXPERT_MODEL","meta.llama3-1-8b-instruct-v1:0")},
+    "ml_expert":                    {"provider": "bedrock", "model": os.getenv("ML_EXPERT_MODEL",       "meta.llama3-1-8b-instruct-v1:0")},
+    "math_reasoning_expert":        {"provider": "bedrock", "model": os.getenv("MATH_EXPERT_MODEL",     "amazon.nova-pro-v1:0")},
+    "dl_expert":                    {"provider": "bedrock", "model": os.getenv("DL_EXPERT_MODEL",       "meta.llama3-1-8b-instruct-v1:0")},
+    "genai_expert":                 {"provider": "bedrock", "model": os.getenv("GENAI_EXPERT_MODEL",    "meta.llama3-1-8b-instruct-v1:0")},
+    "research_expert":              {"provider": "bedrock", "model": os.getenv("RESEARCH_EXPERT_MODEL", "mistral.mistral-7b-instruct-v0:2")},
+    "agentic_ai_expert":            {"provider": "bedrock", "model": os.getenv("AGENTIC_EXPERT_MODEL",  "meta.llama3-1-8b-instruct-v1:0")},
+    "rag_expert":                   {"provider": "bedrock", "model": os.getenv("RAG_EXPERT_MODEL",      "meta.llama3-1-8b-instruct-v1:0")},
+    "llm_eval_expert":              {"provider": "bedrock", "model": os.getenv("LLM_EVAL_EXPERT_MODEL", "meta.llama3-1-8b-instruct-v1:0")},
+    "friendly_conversation_expert": {"provider": "bedrock", "model": os.getenv("FRIENDLY_EXPERT_MODEL", "amazon.nova-micro-v1:0")},
+    "multimodal_expert":            {"provider": "openai",  "model": MULTIMODAL_OPENAI_MODEL},
+    "gpt_fallback":                 {"provider": "openai",  "model": OPENAI_FALLBACK_MODEL},
 }
 
 EXPERT_KEYWORDS = {
@@ -786,13 +792,49 @@ def normalize_messages_for_ollama(messages: List[Dict[str, Any]]) -> List[Dict[s
     return normalized
 
 
-def ollama_chat(model: str, messages: List[Dict[str, Any]]) -> str:
-    url = f"{OLLAMA_BASE_URL}/api/chat"
-    payload = {"model": model, "messages": normalize_messages_for_ollama(messages), "stream": False}
-    resp = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT_SEC)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["message"]["content"]
+def normalize_messages_for_bedrock(messages: List[Dict[str, Any]]) -> tuple[str, List[Dict[str, Any]]]:
+    """Split messages into system string + conversation turns for Bedrock Converse API."""
+    system_parts: List[str] = []
+    conversation: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = str(msg.get("role", "user"))
+        content = msg.get("content", "")
+        # Flatten list content (multimodal parts) to text only
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ).strip()
+        else:
+            content = str(content)
+        if role == "system":
+            system_parts.append(content)
+        else:
+            # Bedrock only accepts alternating user/assistant turns
+            bedrock_role = "user" if role == "user" else "assistant"
+            if conversation and conversation[-1]["role"] == bedrock_role:
+                # Merge consecutive same-role messages
+                conversation[-1]["content"][0]["text"] += "\n" + content
+            else:
+                conversation.append({"role": bedrock_role, "content": [{"text": content}]})
+    system_str = "\n".join(system_parts)
+    # Bedrock requires conversation to start with a user turn
+    if not conversation or conversation[0]["role"] != "user":
+        conversation.insert(0, {"role": "user", "content": [{"text": "(start of conversation)"}]})
+    return system_str, conversation
+
+
+def bedrock_chat(model_id: str, messages: List[Dict[str, Any]]) -> str:
+    system_str, conversation = normalize_messages_for_bedrock(messages)
+    kwargs: Dict[str, Any] = {
+        "modelId": model_id,
+        "messages": conversation,
+        "inferenceConfig": {"maxTokens": 1024, "temperature": 0.7},
+    }
+    if system_str:
+        kwargs["system"] = [{"text": system_str}]
+    response = bedrock_runtime.converse(**kwargs)
+    return response["output"]["message"]["content"][0]["text"]
 
 
 def generate_with_route(messages: List[Dict[str, Any]], router_decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -803,8 +845,8 @@ def generate_with_route(messages: List[Dict[str, Any]], router_decision: Dict[st
     fallback_reason = None
 
     try:
-        if provider == "ollama":
-            text = ollama_chat(model=model, messages=messages)
+        if provider == "bedrock":
+            text = bedrock_chat(model_id=model, messages=messages)
         else:
             resp = client.chat.completions.create(model=model, messages=messages)
             text = resp.choices[0].message.content
