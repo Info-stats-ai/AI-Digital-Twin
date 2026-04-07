@@ -341,6 +341,35 @@ def send_verification_email(to_email: str, verification_url: str) -> None:
         server.send_message(msg)
 
 
+def create_password_reset_token(user_id: str, email: str) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(minutes=30)
+    payload = {"sub": user_id, "email": email, "purpose": "password_reset", "exp": exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def send_password_reset_email(to_email: str, reset_url: str) -> None:
+    if not SMTP_HOST:
+        print(f"[DEV] Password reset link for {to_email}: {reset_url}")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = "Reset your AI Digital Twin password"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(
+        "You requested a password reset for your AI Digital Twin account.\n\n"
+        "Click the link below to reset your password (expires in 30 minutes):\n"
+        f"{reset_url}\n\n"
+        "If you did not request this, you can safely ignore this email."
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        if SMTP_USER and SMTP_PASS:
+            server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+
 def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     for user in load_users():
         if user["user_id"] == user_id:
@@ -1114,6 +1143,19 @@ class RegisterResponse(BaseModel):
     email: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
 class SessionDeleteRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     delete_reason: Optional[str] = None
@@ -1538,6 +1580,68 @@ async def login(request: LoginRequest):
         email=matched.get("email"),
         phone=matched.get("phone"),
     )
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    email = normalize_email(request.email)
+    users = load_users()
+    matched = None
+    for user in users:
+        if user.get("email") == email:
+            matched = user
+            break
+    # Always return generic success to avoid user enumeration
+    if matched:
+        reset_token = create_password_reset_token(matched["user_id"], email)
+        reset_url = f"{APP_BASE_URL}/?reset_token={reset_token}"
+        send_password_reset_email(email, reset_url)
+    return {"message": "If an account with that email exists, a password reset link has been sent."}
+
+
+@app.post("/auth/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    try:
+        payload = jwt.decode(request.token, JWT_SECRET, algorithms=[JWT_ALG])
+        if payload.get("purpose") != "password_reset":
+            raise HTTPException(status_code=400, detail="Invalid reset token")
+        user_id = payload.get("sub")
+        email = payload.get("email")
+        if not user_id or not email:
+            raise HTTPException(status_code=400, detail="Invalid reset token")
+    except JWTError as exc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token") from exc
+
+    users = load_users()
+    matched = None
+    for user in users:
+        if user["user_id"] == user_id and user.get("email") == email:
+            matched = user
+            break
+    if not matched:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    matched["password_hash"] = hash_password(request.new_password)
+    matched["password_updated_at"] = now_iso()
+    save_users(users)
+    return {"message": "Password reset successfully. You can now log in with your new password."}
+
+
+@app.post("/auth/resend-verification")
+async def resend_verification(request: ResendVerificationRequest):
+    email = normalize_email(request.email)
+    users = load_users()
+    matched = None
+    for user in users:
+        if user.get("email") == email:
+            matched = user
+            break
+    # Always return generic success to avoid user enumeration
+    if matched and not matched.get("is_email_verified", False):
+        verify_token = create_email_verification_token(matched["user_id"], email)
+        verification_url = f"{API_PUBLIC_BASE_URL}/auth/verify-email?token={verify_token}"
+        send_verification_email(email, verification_url)
+    return {"message": "If your account exists and is not yet verified, a new verification email has been sent."}
 
 
 @app.get("/auth/me", response_model=CurrentUserResponse)

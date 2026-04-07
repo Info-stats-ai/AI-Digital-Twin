@@ -63,13 +63,31 @@ interface ProgressApiResponse {
     events: AgentTraceItem[];
 }
 
-function getApiBaseUrl(): string {
-    if (API_BASE_URL_ENV) return API_BASE_URL_ENV;
+function getApiBaseCandidates(): string[] {
+    if (API_BASE_URL_ENV) return [API_BASE_URL_ENV];
     if (typeof window !== 'undefined') {
         const host = window.location.hostname;
-        return `http://${host}:8000`;
+        const candidates = [`http://${host}:8000`, 'http://localhost:8000', 'http://127.0.0.1:8000'];
+        return Array.from(new Set(candidates));
     }
-    return 'http://localhost:8000';
+    return ['http://localhost:8000', 'http://127.0.0.1:8000'];
+}
+
+async function fetchWithApiFallback(
+    path: string,
+    initFactory: (apiBase: string) => RequestInit,
+): Promise<Response> {
+    const bases = getApiBaseCandidates();
+    let lastError: unknown = null;
+    for (const base of bases) {
+        try {
+            const response = await fetch(`${base}${path}`, initFactory(base));
+            return response;
+        } catch (err) {
+            lastError = err;
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Network request failed');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -104,7 +122,7 @@ export default function Twin() {
     const [sessionId, setSessionId] = useState<string>('');
     const [token, setToken] = useState<string>('');
     const [profile, setProfile] = useState<UserProfile | null>(null);
-    const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+    const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
     const [firstName, setFirstName] = useState('');
     const [lastName, setLastName] = useState('');
     const [email, setEmail] = useState('');
@@ -114,6 +132,10 @@ export default function Twin() {
     const [isAuthLoading, setIsAuthLoading] = useState(false);
     const [authInfo, setAuthInfo] = useState('');
     const [executingAgent, setExecutingAgent] = useState<string>('');
+    const [forgotEmail, setForgotEmail] = useState('');
+    const [resetToken, setResetToken] = useState('');
+    const [newPassword, setNewPassword] = useState('');
+    const [confirmPassword, setConfirmPassword] = useState('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -132,6 +154,17 @@ export default function Twin() {
         setSessionId(storedSession);
         if (storedProfile) {
             setProfile(JSON.parse(storedProfile));
+        }
+        // Check for password reset token in URL
+        if (typeof window !== 'undefined') {
+            const params = new URLSearchParams(window.location.search);
+            const rt = params.get('reset_token');
+            if (rt) {
+                setResetToken(rt);
+                setAuthMode('reset');
+                // Clean the token from the URL bar without reload
+                window.history.replaceState({}, '', window.location.pathname);
+            }
         }
     }, []);
 
@@ -162,7 +195,6 @@ export default function Twin() {
         }
         try {
             const endpoint = authMode === 'register' ? '/auth/register' : '/auth/login';
-            const apiBaseUrl = getApiBaseUrl();
             const payload = authMode === 'register'
                 ? {
                     first_name: firstName,
@@ -176,11 +208,14 @@ export default function Twin() {
                     password,
                 };
 
-            const response = await fetch(`${apiBaseUrl}${endpoint}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
+            const response = await fetchWithApiFallback(
+                endpoint,
+                () => ({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                }),
+            );
 
             const raw = await response.text();
             let data: unknown = {};
@@ -219,6 +254,73 @@ export default function Twin() {
         }
     };
 
+    const submitForgotPassword = async () => {
+        if (!forgotEmail.trim()) { setAuthError('Email is required'); return; }
+        setIsAuthLoading(true);
+        setAuthError('');
+        setAuthInfo('');
+        try {
+            await fetchWithApiFallback('/auth/forgot-password', () => ({
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: forgotEmail.trim() }),
+            }));
+            setAuthInfo('If an account with that email exists, a reset link has been sent. Check your inbox (or backend logs in dev mode).');
+            setForgotEmail('');
+        } catch {
+            setAuthError('Something went wrong. Please try again.');
+        } finally {
+            setIsAuthLoading(false);
+        }
+    };
+
+    const submitResetPassword = async () => {
+        if (!newPassword.trim()) { setAuthError('New password is required'); return; }
+        if (newPassword !== confirmPassword) { setAuthError('Passwords do not match'); return; }
+        setIsAuthLoading(true);
+        setAuthError('');
+        setAuthInfo('');
+        try {
+            const response = await fetchWithApiFallback('/auth/reset-password', () => ({
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: resetToken, new_password: newPassword }),
+            }));
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error((data as Record<string, string>).detail || 'Reset failed');
+            }
+            setAuthInfo('Password reset successfully! You can now log in.');
+            setNewPassword('');
+            setConfirmPassword('');
+            setResetToken('');
+            setAuthMode('login');
+        } catch (error) {
+            setAuthError(error instanceof Error ? error.message : 'Reset failed');
+        } finally {
+            setIsAuthLoading(false);
+        }
+    };
+
+    const resendVerification = async () => {
+        if (!email.trim()) { setAuthError('Enter your email above first'); return; }
+        setIsAuthLoading(true);
+        setAuthError('');
+        setAuthInfo('');
+        try {
+            await fetchWithApiFallback('/auth/resend-verification', () => ({
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: email.trim() }),
+            }));
+            setAuthInfo('Verification email resent. Check your inbox (or backend logs in dev mode).');
+        } catch {
+            setAuthError('Something went wrong. Please try again.');
+        } finally {
+            setIsAuthLoading(false);
+        }
+    };
+
     const logout = () => {
         setToken('');
         setProfile(null);
@@ -247,12 +349,14 @@ export default function Twin() {
         let pollTimer: ReturnType<typeof setInterval> | null = null;
 
         try {
-            const apiBaseUrl = getApiBaseUrl();
             pollTimer = setInterval(async () => {
                 try {
-                    const progressResp = await fetch(`${apiBaseUrl}/chat/progress/${requestId}`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
+                    const progressResp = await fetchWithApiFallback(
+                        `/chat/progress/${requestId}`,
+                        () => ({
+                            headers: { Authorization: `Bearer ${token}` },
+                        }),
+                    );
                     if (!progressResp.ok) return;
                     const progress: ProgressApiResponse = await progressResp.json();
                     const last = progress.events[progress.events.length - 1];
@@ -269,26 +373,32 @@ export default function Twin() {
                 formData.append('request_id', requestId);
                 if (sessionId) formData.append('session_id', sessionId);
                 selectedFiles.forEach((file) => formData.append('files', file));
-                response = await fetch(`${apiBaseUrl}/chat/rag`, {
-                    method: 'POST',
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                    },
-                    body: formData,
-                });
-            } else {
-                response = await fetch(`${apiBaseUrl}/chat`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${token}`,
-                    },
-                    body: JSON.stringify({
-                        message: input,
-                        session_id: sessionId || undefined,
-                        request_id: requestId,
+                response = await fetchWithApiFallback(
+                    '/chat/rag',
+                    () => ({
+                        method: 'POST',
+                        headers: {
+                            Authorization: `Bearer ${token}`,
+                        },
+                        body: formData,
                     }),
-                });
+                );
+            } else {
+                response = await fetchWithApiFallback(
+                    '/chat',
+                    () => ({
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`,
+                        },
+                        body: JSON.stringify({
+                            message: input,
+                            session_id: sessionId || undefined,
+                            request_id: requestId,
+                        }),
+                    }),
+                );
             }
 
             if (!response.ok) throw new Error('Failed to send message');
@@ -361,69 +471,158 @@ export default function Twin() {
 
             {!token && (
                 <div className="p-4 border-b border-gray-200 bg-white">
-                    <div className="flex gap-2 mb-3">
-                        <button
-                            onClick={() => setAuthMode('login')}
-                            className={`px-3 py-1 rounded text-sm ${authMode === 'login' ? 'bg-slate-700 text-white' : 'bg-gray-100 text-gray-700'}`}
-                        >
-                            Login
-                        </button>
-                        <button
-                            onClick={() => setAuthMode('register')}
-                            className={`px-3 py-1 rounded text-sm ${authMode === 'register' ? 'bg-slate-700 text-white' : 'bg-gray-100 text-gray-700'}`}
-                        >
-                            Register
-                        </button>
-                    </div>
 
-                    {authMode === 'register' && (
-                        <div className="grid grid-cols-2 gap-2 mb-2">
-                            <input
-                                value={firstName}
-                                onChange={(e) => setFirstName(e.target.value)}
-                                placeholder="First name"
-                                className="px-3 py-2 border rounded"
-                            />
-                            <input
-                                value={lastName}
-                                onChange={(e) => setLastName(e.target.value)}
-                                placeholder="Last name"
-                                className="px-3 py-2 border rounded"
-                            />
+                    {/* Tab bar — only for login / register */}
+                    {(authMode === 'login' || authMode === 'register') && (
+                        <div className="flex gap-2 mb-3">
+                            <button
+                                onClick={() => { setAuthMode('login'); setAuthError(''); setAuthInfo(''); }}
+                                className={`px-3 py-1 rounded text-sm ${authMode === 'login' ? 'bg-slate-700 text-white' : 'bg-gray-100 text-gray-700'}`}
+                            >
+                                Login
+                            </button>
+                            <button
+                                onClick={() => { setAuthMode('register'); setAuthError(''); setAuthInfo(''); }}
+                                className={`px-3 py-1 rounded text-sm ${authMode === 'register' ? 'bg-slate-700 text-white' : 'bg-gray-100 text-gray-700'}`}
+                            >
+                                Register
+                            </button>
                         </div>
                     )}
 
-                    <div className="grid grid-cols-2 gap-2 mb-2">
-                        <input
-                            value={email}
-                            onChange={(e) => setEmail(e.target.value)}
-                            placeholder={authMode === 'register' ? 'Email (required)' : 'Email'}
-                            className="px-3 py-2 border rounded"
-                        />
-                        <input
-                            value={phone}
-                            onChange={(e) => setPhone(e.target.value)}
-                            placeholder="Phone (optional)"
-                            className="px-3 py-2 border rounded"
-                            disabled={authMode === 'login'}
-                        />
-                    </div>
-                    <input
-                        type="password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        placeholder="Password"
-                        className="w-full px-3 py-2 border rounded mb-2"
-                    />
-                    {authError && <p className="text-red-600 text-sm mb-2">{authError}</p>}
-                    {authInfo && <p className="text-green-700 text-sm mb-2">{authInfo}</p>}
-                    <button
-                        onClick={submitAuth}
-                        disabled={isAuthLoading}
-                        className="w-full px-3 py-2 bg-slate-700 text-white rounded disabled:opacity-50"
-                    >
-                        {isAuthLoading ? 'Please wait...' : authMode === 'register' ? 'Create account' : 'Login'}
-                    </button>
+                    {/* ── Forgot password form ── */}
+                    {authMode === 'forgot' && (
+                        <div>
+                            <p className="text-sm font-medium text-gray-700 mb-2">Reset your password</p>
+                            <input
+                                type="email"
+                                value={forgotEmail}
+                                onChange={(e) => setForgotEmail(e.target.value)}
+                                placeholder="Enter your account email"
+                                className="w-full px-3 py-2 border rounded mb-2"
+                            />
+                            {authError && <p className="text-red-600 text-sm mb-2">{authError}</p>}
+                            {authInfo && <p className="text-green-700 text-sm mb-2">{authInfo}</p>}
+                            <button
+                                onClick={submitForgotPassword}
+                                disabled={isAuthLoading}
+                                className="w-full px-3 py-2 bg-slate-700 text-white rounded disabled:opacity-50 mb-2"
+                            >
+                                {isAuthLoading ? 'Sending...' : 'Send reset link'}
+                            </button>
+                            <button
+                                onClick={() => { setAuthMode('login'); setAuthError(''); setAuthInfo(''); }}
+                                className="text-sm text-slate-600 underline"
+                            >
+                                Back to login
+                            </button>
+                        </div>
+                    )}
+
+                    {/* ── Reset password form (arrived via email link) ── */}
+                    {authMode === 'reset' && (
+                        <div>
+                            <p className="text-sm font-medium text-gray-700 mb-2">Set a new password</p>
+                            <input
+                                type="password"
+                                value={newPassword}
+                                onChange={(e) => setNewPassword(e.target.value)}
+                                placeholder="New password (min 8 chars)"
+                                className="w-full px-3 py-2 border rounded mb-2"
+                            />
+                            <input
+                                type="password"
+                                value={confirmPassword}
+                                onChange={(e) => setConfirmPassword(e.target.value)}
+                                placeholder="Confirm new password"
+                                className="w-full px-3 py-2 border rounded mb-2"
+                            />
+                            {authError && <p className="text-red-600 text-sm mb-2">{authError}</p>}
+                            {authInfo && <p className="text-green-700 text-sm mb-2">{authInfo}</p>}
+                            <button
+                                onClick={submitResetPassword}
+                                disabled={isAuthLoading}
+                                className="w-full px-3 py-2 bg-slate-700 text-white rounded disabled:opacity-50"
+                            >
+                                {isAuthLoading ? 'Resetting...' : 'Reset password'}
+                            </button>
+                        </div>
+                    )}
+
+                    {/* ── Login / Register form ── */}
+                    {(authMode === 'login' || authMode === 'register') && (
+                        <>
+                            {authMode === 'register' && (
+                                <div className="grid grid-cols-2 gap-2 mb-2">
+                                    <input
+                                        value={firstName}
+                                        onChange={(e) => setFirstName(e.target.value)}
+                                        placeholder="First name"
+                                        className="px-3 py-2 border rounded"
+                                    />
+                                    <input
+                                        value={lastName}
+                                        onChange={(e) => setLastName(e.target.value)}
+                                        placeholder="Last name"
+                                        className="px-3 py-2 border rounded"
+                                    />
+                                </div>
+                            )}
+
+                            <div className="grid grid-cols-2 gap-2 mb-2">
+                                <input
+                                    value={email}
+                                    onChange={(e) => setEmail(e.target.value)}
+                                    placeholder={authMode === 'register' ? 'Email (required)' : 'Email'}
+                                    className="px-3 py-2 border rounded"
+                                />
+                                <input
+                                    value={phone}
+                                    onChange={(e) => setPhone(e.target.value)}
+                                    placeholder="Phone (optional)"
+                                    className="px-3 py-2 border rounded"
+                                    disabled={authMode === 'login'}
+                                />
+                            </div>
+                            <input
+                                type="password"
+                                value={password}
+                                onChange={(e) => setPassword(e.target.value)}
+                                placeholder="Password"
+                                className="w-full px-3 py-2 border rounded mb-2"
+                            />
+                            {authError && <p className="text-red-600 text-sm mb-2">{authError}</p>}
+                            {authInfo && <p className="text-green-700 text-sm mb-2">{authInfo}</p>}
+
+                            {/* Resend verification button shown only when that specific error fires */}
+                            {authError === 'Please verify your email before logging in' && (
+                                <button
+                                    onClick={resendVerification}
+                                    disabled={isAuthLoading}
+                                    className="w-full px-3 py-2 mb-2 border border-slate-600 text-slate-700 rounded text-sm hover:bg-slate-50 disabled:opacity-50"
+                                >
+                                    {isAuthLoading ? 'Sending...' : 'Resend verification email'}
+                                </button>
+                            )}
+
+                            <button
+                                onClick={submitAuth}
+                                disabled={isAuthLoading}
+                                className="w-full px-3 py-2 bg-slate-700 text-white rounded disabled:opacity-50"
+                            >
+                                {isAuthLoading ? 'Please wait...' : authMode === 'register' ? 'Create account' : 'Login'}
+                            </button>
+
+                            {authMode === 'login' && (
+                                <button
+                                    onClick={() => { setAuthMode('forgot'); setAuthError(''); setAuthInfo(''); setForgotEmail(email); }}
+                                    className="mt-2 text-sm text-slate-500 underline w-full text-left"
+                                >
+                                    Forgot password?
+                                </button>
+                            )}
+                        </>
+                    )}
                 </div>
             )}
 
