@@ -1667,13 +1667,20 @@ async def chat(request: ChatRequest, current_user: Dict[str, Any] = Depends(get_
         if session_env.is_deleted:
             raise HTTPException(status_code=404, detail="Session is deleted. Restore it or start a new session.")
 
+        # Automatically retrieve from stored vectors if the user has uploaded docs
+        auto_rag_chunks = None
+        stored_vectors = await asyncio.to_thread(load_user_vectors, user_id)
+        if stored_vectors:
+            rag_result = await rag_retriever_agent(user_id, request.message, top_k=RAG_TOP_K)
+            auto_rag_chunks = rag_result.get("chunks") or None
+
         result = await execute_chat_pipeline(
             user_id=user_id,
             session_id=session_id,
             query=request.message,
             session_env=session_env,
             image_urls=request.image_urls,
-            rag_chunks=None,
+            rag_chunks=auto_rag_chunks,
             request_id=request_id,
         )
         router_decision = result["router_decision"]
